@@ -1,0 +1,9 @@
+board_manager:
+    additional_urls:
+        - https://espressif.github.io/arduino-esp32/package_esp32_dev_index.json
+directories:
+    # Windows default: C:\Users\<username>\AppData\Local\Arduino15
+    data: ""
+    # Path to your arduino user libraries folder
+    user: ""
+    downloads: ""

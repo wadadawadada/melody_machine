@@ -1,0 +1,45 @@
+# Build artifacts
+build/
+build_otg_msc/
+build_otg_msc_default/
+
+# Backup directories
+backup/
+
+# Old/previous firmware binaries at root (keep melody_machine.bin for release)
+flashed_app.bin
+flashed_app_full.bin
+
+# Serial logger utilities (personal dev tools)
+serial_logger*.ps1
+
+# Local build config (contains personal paths)
+arduino-cli-config.yml
+
+# Internal dev docs
+SUMMARY.md
+WORKFLOW.md
+about.md
+todo.md
+
+# Logs
+*.log
+
+# Arduino CLI cache
+.arduino_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor / AI tools
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# Python bytecode (used by build.sh for image conversion)
+__pycache__/
+*.pyc
