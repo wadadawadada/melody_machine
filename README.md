@@ -21,12 +21,7 @@ MP3 player and internet radio firmware for the **LilyGO T-LoRa Pager** (ESP32-S3
 
 ### Themes
 
-| ID | Name | Style |
-|----|------|-------|
-| 0 | Default | Dark green |
-| 1 | Windows 95 | Gray / navy |
-| 2 | Fantasy | Dark purple / pink |
-| 3 | Linux Console | CRT green on black |
+4 switchable themes are available in Settings → Theme.
 
 ---
 
