@@ -70,11 +70,12 @@ void loop() {
     static uint32_t hb = 0;
     if (millis() - hb > 2000) {
         hb = millis();
-        Serial.printf("[HB] t=%lu screen=%d state=%d radio=%d elapsed=%lu vol=%u heap=%u largest=%u dbg=%d\n",
+        Serial.printf("[HB] t=%lu screen=%d state=%d radio=%d buf=%d elapsed=%lu vol=%u heap=%u largest=%u dbg=%d\n",
                       (unsigned long)millis(),
                       (int)uiCurrentScreen(),
                       (int)audioPlayerGetState(),
                       (int)radioPlayerGetStatus(),
+                      (int)radioPlayerGetBufferFillPct(),
                       (unsigned long)audioPlayerGetElapsed(),
                       (unsigned)audioPlayerGetVolume(),
                       (unsigned)ESP.getFreeHeap(),

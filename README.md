@@ -1,4 +1,4 @@
-# Melody Machine
+# Melody Machine v0.1
 
 MP3 player and internet radio firmware for the **LilyGO T-LoRa Pager** (ESP32-S3).
 
@@ -58,7 +58,7 @@ MP3 player and internet radio firmware for the **LilyGO T-LoRa Pager** (ESP32-S3
 | Rotate encoder | Previous / Next track |
 | Click encoder | Toggle pause |
 | `P` | Toggle pause |
-| `Q` / `W` | Volume −5 / +5 |
+| `Q` / `A` | Volume +5 / -5 |
 | `R` | Cycle repeat: off → one → all |
 | `H` | Toggle shuffle |
 | `B` | Back to browser |
@@ -122,7 +122,7 @@ Edit `/config/settings.json` on the SD card (or use the WiFi screen in settings)
 
 ## Flashing Pre-built Firmware
 
-Download `melody_machine.bin` from the [Releases](../../releases) page and flash with `esptool.py`:
+Download `melody_machine.bin` from the [Releases](../../releases/tag/v0.1) page and flash with `esptool.py`:
 
 ```bash
 esptool.py --chip esp32s3 --port COM3 --baud 921600 \

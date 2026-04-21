@@ -174,7 +174,7 @@ static bool isRadioMode();
 static void showPwOverlay(const String& ssid);
 static void hidePwOverlay();
 static void pwHandleKey(char k, char raw);
-static void requestRadioPlay(int idx);
+static void requestRadioPlay(int idx, const char* why);
 static bool saveScreenshotToSd(char* outPath, size_t outPathLen);
 static lv_draw_buf_t* takeSnapshotCompat(lv_obj_t* obj, lv_color_format_t cf);
 
@@ -1056,11 +1056,13 @@ static void switchMode(bool toRadio) {
     refreshPlayer();
 }
 
-static void requestRadioPlay(int idx) {
+static void requestRadioPlay(int idx, const char* why) {
     int n = fileBrowserRadioCount();
     if (n <= 0) return;
     if (idx < 0) idx = 0;
     if (idx >= n) idx = n - 1;
+    Serial.printf("[UI-RPLAY] why=%s idx=%d cur=%d pl=%d rs=%d\n",
+                  (why ? why : "?"), idx, _listCursor, _plIdx, (int)radioPlayerGetStatus());
     _listCursor = idx;
     RadioStatus rs = radioPlayerGetStatus();
     bool radioActive = (rs == RS_CONNECTING || rs == RS_BUFFERING || rs == RS_PLAYING);
@@ -1155,12 +1157,32 @@ static void refreshPlayer() {
         lv_obj_set_style_text_color(_lblPlCount, TH->muted, 0);
         lv_obj_set_style_border_color(_lblPlCount, TH->border, 0);
 
-        // Progress bar = buffer fill
-        int fillW = (int)((int64_t)radioPlayerGetBufferFillPct() * SW / 100);
-        if (fillW < 1 && (rs == RS_PLAYING || rs == RS_BUFFERING)) fillW = 1;
+        // Progress bar in radio mode:
+        // - CONNECTING/BUFFERING: show buffer fill.
+        //   If decoder reports 0 for a while, use a capped fallback ramp (not infinite).
+        // - PLAYING: full green.
+        static RadioStatus prevRs = RS_IDLE;
+        static uint32_t rsPhaseStartMs = 0;
+        if (rs != prevRs) {
+            prevRs = rs;
+            rsPhaseStartMs = millis();
+        }
+
+        int fillPct = radioPlayerGetBufferFillPct();
+        if (fillPct < 0) fillPct = 0;
+        if (fillPct > 100) fillPct = 100;
+
+        int fillW = (rs == RS_PLAYING) ? SW : (int)((int64_t)fillPct * SW / 100);
+        if (fillW < 1 && fillPct > 0 && (rs == RS_BUFFERING || rs == RS_CONNECTING)) fillW = 1;
         if (fillW > SW) fillW = SW;
         lv_obj_set_width(_barProgress, fillW > 0 ? fillW : 1);
         lv_obj_set_style_bg_color(_barProgress, (rs == RS_BUFFERING || rs == RS_CONNECTING) ? TH->warn : TH->accent, 0);
+        static uint32_t lastUiRadLog = 0;
+        if (millis() - lastUiRadLog > 1000) {
+            lastUiRadLog = millis();
+            Serial.printf("[UI-RAD] rs=%d rawPct=%d fillW=%d sw=%d\n",
+                          (int)rs, fillPct, fillW, SW);
+        }
 
         // Playlist rows = stations
         for (int i = 0; i < PLAYLIST_ROWS; i++) {
@@ -1633,7 +1655,10 @@ void uiManagerLoop() {
             if (!radio && !_usbModeEnabled && audioPlaybackAllowed() && fileBrowserTrackCount() > 0)
                 startPlaying(_listCursor);
             else if (radio && fileBrowserRadioCount() > 0) {
-                requestRadioPlay(_listCursor);
+                RadioStatus rs = radioPlayerGetStatus();
+                if (rs == RS_IDLE || rs == RS_ERROR) {
+                    requestRadioPlay(_listCursor, "rot_click");
+                }
             }
         } else if (_screen == UI_SETTINGS) {
             key = '\n'; keyState = KB_PRESSED;
@@ -1669,7 +1694,6 @@ void uiManagerLoop() {
     if (rot.dir != ROTARY_DIR_NONE || rot.centerBtnPressed) instance.clearRotaryMsg();
     if (keyState != KB_PRESSED) return;
 
-    if (_screen == UI_PLAYER && key == 0 && (millis() - _lastPauseToggleMs > 120)) key = ' ';
     if (key == 0) return;
 
     char k = (char)tolower((unsigned char)key);
@@ -1695,7 +1719,7 @@ void uiManagerLoop() {
             if (radio) {
                 // Space in radio mode: stop/start
                 if (radioPlayerGetStatus() == RS_IDLE || radioPlayerGetStatus() == RS_ERROR) {
-                    requestRadioPlay(_plIdx);
+                    requestRadioPlay(_plIdx, "space");
                 } else {
                     _pendingRadioPlayIdx = -1;
                     radioPlayerStop();
@@ -1711,11 +1735,7 @@ void uiManagerLoop() {
             refreshPlayer();
         } else if (key == '\n' || key == '\r') {
             if (_usbModeEnabled || !audioPlaybackAllowed()) return;
-            if (radio) {
-                if (fileBrowserRadioCount() > 0) {
-                    requestRadioPlay(_listCursor);
-                }
-            } else {
+            if (!radio) {
                 if (fileBrowserTrackCount() > 0) startPlaying(_listCursor);
             }
         } else if (k == 'q') {
@@ -1729,13 +1749,13 @@ void uiManagerLoop() {
         } else if (k == 'w') {
             if (_usbModeEnabled || !audioPlaybackAllowed()) return;
             if (radio && _plIdx > 0) {
-                requestRadioPlay(_plIdx - 1);
+                requestRadioPlay(_plIdx - 1, "prev");
             } else if (!radio) playPrev();
         } else if (k == 'd') {
             if (_usbModeEnabled || !audioPlaybackAllowed()) return;
             if (radio) {
                 int n = fileBrowserRadioCount();
-                if (n > 0) requestRadioPlay((_plIdx + 1) % n);
+                if (n > 0) requestRadioPlay((_plIdx + 1) % n, "next");
             } else playNext();
         } else if (k == 'r') {
             if (!radio) { _repeat = (RepeatMode)(((int)_repeat + 1) % 3); saveUiSettings(); refreshPlayer(); }

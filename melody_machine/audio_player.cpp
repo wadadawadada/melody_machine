@@ -168,6 +168,8 @@ static void audioTask(void*) {
     uint32_t lastVolApply = 0;
     uint8_t  appliedVol  = 255;
     uint32_t lastPlayLog = 0;
+    uint32_t lastRadioLog = 0;
+    bool radioHadPositiveFill = false;
 
     static int16_t silenceBuf[256];
     memset(silenceBuf, 0, sizeof(silenceBuf));
@@ -185,6 +187,7 @@ static void audioTask(void*) {
         _icyBufSize   = 0;
         _bufferFillPct = 0;
         _radioStatus  = RS_IDLE;
+        radioHadPositiveFill = false;
         // Keep I2S open while switching tracks to avoid channel reinit races.
         // Fully close only on explicit stop paths.
         if (closeCodec) _out->hardClose();
@@ -360,10 +363,20 @@ static void audioTask(void*) {
                     if (_icyBuf && _icyBufSize > 0) {
                         uint32_t fill = _icyBuf->getFillLevel();
                         _bufferFillPct = (int)((uint64_t)fill * 100 / _icyBufSize);
-                        if (_bufferFillPct >= 35 && _radioStatus == RS_BUFFERING) {
+                        if (fill > 0) radioHadPositiveFill = true;
+                        // Promote to PLAYING by real buffer threshold or by
+                        // confirmed decoder progress (elapsed > 0).
+                        if ((_bufferFillPct >= 35 || _elapsed >= 1) &&
+                            _radioStatus == RS_BUFFERING) {
                             _radioStatus = RS_PLAYING;
-                        } else if (_bufferFillPct <= 8 && _radioStatus == RS_PLAYING) {
-                            _radioStatus = RS_BUFFERING;
+                        }
+                        if (millis() - lastRadioLog > 1000) {
+                            lastRadioLog = millis();
+                            Serial.printf("[AUDIO-RAD] st=%d fill=%u/%u pct=%d\n",
+                                          (int)_radioStatus,
+                                          (unsigned)fill,
+                                          (unsigned)_icyBufSize,
+                                          (int)_bufferFillPct);
                         }
                     }
                     if (millis() - lastPlayLog > 2000) {
@@ -434,6 +447,8 @@ bool        audioPlayerIsPaused()    { return _state == PS_PAUSED; }
 void        audioPlayerSetVolume(uint8_t vol) {
     _volume = (vol > 100) ? 100 : vol;
     _prefs.putUInt("volume", _volume);
+    // Apply immediately so UI controls remain responsive even if decoder loop blocks.
+    instance.codec.setVolume(_volume);
 }
 uint8_t     audioPlayerGetVolume()   { return _volume; }
 PlayerState audioPlayerGetState()    { return _state; }
