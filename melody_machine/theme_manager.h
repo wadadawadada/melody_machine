@@ -2,7 +2,7 @@
 #include <Arduino.h>
 #include <lvgl.h>
 
-enum ThemeId { TH_DEFAULT = 0, TH_WIN95 = 1, TH_FANTASY = 2, TH_LINUX = 3 };
+enum ThemeId { TH_DEFAULT = 0, TH_WIN95 = 1, TH_FANTASY = 2, TH_LINUX = 3, TH_FONY = 4, TH_MONO = 5 };
 
 struct Theme {
     const char*      name;

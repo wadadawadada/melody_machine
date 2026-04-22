@@ -80,6 +80,7 @@ static lv_obj_t* _scrInfo     = nullptr;
 static lv_obj_t* _scrWifi     = nullptr;
 
 // Player widgets
+static lv_obj_t* _nowClip = nullptr;   // clipping container for marquee
 static lv_obj_t* _lblNow = nullptr;
 static lv_obj_t* _lblState = nullptr;
 static lv_obj_t* _barVolume = nullptr;
@@ -93,6 +94,7 @@ static lv_obj_t* _lblRepeat = nullptr;
 static lv_obj_t* _barProgress = nullptr;
 static lv_obj_t* _lblBatPct = nullptr;
 static lv_obj_t* _batFill = nullptr;
+static lv_obj_t* _lblBatCharge = nullptr;
 static lv_obj_t* _lblWifi = nullptr;
 static lv_obj_t* _lblMode = nullptr;
 static lv_obj_t* _lblListTitle = nullptr;
@@ -117,6 +119,17 @@ static bool _kbBacklight = true;
 static uint32_t _kbTimeoutSec = 0;
 static bool _kbDimmed = false;
 static uint32_t _lastPauseToggleMs = 0;
+
+// Marquee (scrolling title) state
+static enum { MQ_PAUSE_START, MQ_SCROLLING, MQ_PAUSE_END } _mqPhase = MQ_PAUSE_START;
+static uint32_t _mqPhaseMs  = 0;   // when current phase started
+static int32_t  _mqOffsetX  = 0;   // current pixel offset (0 = home)
+static int32_t  _mqTextW    = 0;   // cached text width
+static String   _mqLastText = "";  // detect text change
+static const int32_t  MQ_CLIP_W       = 274;  // visible width (matches _nowClip)
+static const uint32_t MQ_PAUSE_START_MS = 3000; // wait before scrolling
+static const uint32_t MQ_PAUSE_END_MS  = 1500; // wait at end before reset
+static const int32_t  MQ_SPEED_PX_PER_SEC = 40; // scroll speed
 static int _pendingRadioPlayIdx = -1;
 static uint32_t _pendingRadioPlayAtMs = 0;
 static uint32_t _pendingSComboAtMs = 0;
@@ -161,6 +174,7 @@ static void showScreen(UiScreen s);
 static void teardownScreens();
 static void rebuildScreens();
 static void refreshPlayer();
+static void tickMarquee();
 static void refreshSettings();
 static void refreshWifi();
 static void loadUiSettings();
@@ -609,6 +623,17 @@ static void buildPlayer() {
     lv_obj_set_pos(_batFill, 446, 7);
     stylePanel(_batFill, TH->accent);
 
+    // Charging lightning bolt — inside battery box, black, scaled down + rotated
+    _lblBatCharge = lv_label_create(top);
+    styleLabel(_lblBatCharge, lv_color_hex(0x000000), TH->fontSmall);
+    lv_obj_set_pos(_lblBatCharge, 456, 7);
+    lv_label_set_text(_lblBatCharge, LV_SYMBOL_CHARGE);
+    lv_obj_set_style_transform_scale(_lblBatCharge, 190, 0);   // ~74% of original
+    lv_obj_set_style_transform_rotation(_lblBatCharge, 200, 0); // 20° clockwise
+    lv_obj_set_style_transform_pivot_x(_lblBatCharge, 0, 0);
+    lv_obj_set_style_transform_pivot_y(_lblBatCharge, 0, 0);
+    lv_obj_add_flag(_lblBatCharge, LV_OBJ_FLAG_HIDDEN);
+
     // WiFi icon
     _lblWifi = lv_label_create(top);
     styleLabel(_lblWifi, TH->accent, TH->fontSmall);
@@ -631,10 +656,20 @@ static void buildPlayer() {
     lv_obj_set_pos(split, DIVIDER_X, CONTENT_Y);
     stylePanel(split, TH->divider);
 
-    _lblNow = lv_label_create(_scrPlayer);
+    _nowClip = lv_obj_create(_scrPlayer);
+    lv_obj_set_size(_nowClip, MQ_CLIP_W, 26);
+    lv_obj_set_pos(_nowClip, 18, 24);
+    stylePanel(_nowClip, TH->bg);
+    lv_obj_add_flag(_nowClip, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+    lv_obj_clear_flag(_nowClip, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+    lv_obj_set_style_clip_corner(_nowClip, false, 0);
+    lv_obj_set_scrollbar_mode(_nowClip, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(_nowClip, LV_OBJ_FLAG_SCROLLABLE);
+
+    _lblNow = lv_label_create(_nowClip);
     styleLabel(_lblNow, TH->warn, TH->fontTrack);
-    lv_obj_set_pos(_lblNow, 18, 24);
-    lv_obj_set_width(_lblNow, 274);
+    lv_obj_set_pos(_lblNow, 0, 0);
+    lv_obj_set_width(_lblNow, LV_SIZE_CONTENT);
     lv_obj_set_style_text_letter_space(_lblNow, 1, 0);
     lv_obj_set_style_text_align(_lblNow, LV_TEXT_ALIGN_LEFT, 0);
     lv_label_set_long_mode(_lblNow, LV_LABEL_LONG_CLIP);
@@ -708,7 +743,7 @@ static void buildPlayer() {
     stylePanel(rightHeadSep, TH->divider);
 
     _lblListTitle = lv_label_create(_scrPlayer);
-    styleLabel(_lblListTitle, TH->muted, TH->fontSmall);
+    styleLabel(_lblListTitle, TH->accent, TH->fontSmall);
     lv_obj_set_pos(_lblListTitle, 310, 25);
     lv_label_set_text(_lblListTitle, isRadioMode() ? "STATIONS" : "PLAYLIST");
 
@@ -784,10 +819,8 @@ static void buildInfo() {
     lv_label_set_text(_lblInfoRight,
         "[S]          settings\n"
         "[S+H]        screenshot\n"
-        "[I]          controls\n"
         "[rot]        list scroll\n"
         "[rot click]  play select\n"
-        "[SHF+rot]    volume\n"
         "[ENTER]      play track");
 
     lv_obj_t* hint = lv_label_create(_scrInfo);
@@ -812,12 +845,12 @@ static void buildSettings() {
 
     const char* names[SETTINGS_COUNT] = {
         "Back",
+        "Mode",
+        "WiFi network",
         "Brightness",
         "Screen timeout",
         "KB backlight",
         "Theme",
-        "Mode",
-        "WiFi network",
         "Debug mode",
         "USB mode",
         "Restart device",
@@ -978,8 +1011,6 @@ static void startPlaying(int trackIdx) {
     if (trackIdx < 0 || trackIdx >= fileBrowserTrackCount()) return;
     buildPlaylist(trackIdx);
     const FileEntry& e = fileBrowserTrack(_playlist[_plIdx]);
-    settingsPutString("last_track", e.fullPath.c_str());
-    settingsSave();
     audioPlayerPlay(e.fullPath.c_str(), e.size);
     _listCursor = trackIdx;
     clampListWindow(fileBrowserTrackCount());
@@ -1094,13 +1125,29 @@ static void refreshPlayer() {
 
     refreshBatteryState();
     char batBuf[12];
-    snprintf(batBuf, sizeof(batBuf), "%u%%%s", (unsigned)_batteryPct, _batteryCharging ? "+" : "");
+    snprintf(batBuf, sizeof(batBuf), "%u%%", (unsigned)_batteryPct);
     lv_label_set_text(_lblBatPct, batBuf);
     int batW = (BAT_FILL_MAX_W * (int)_batteryPct) / 100;
     if (_batteryPct > 0 && batW < 1) batW = 1;
     if (batW > BAT_FILL_MAX_W) batW = BAT_FILL_MAX_W;
     lv_obj_set_size(_batFill, batW, 8);
-    lv_obj_set_style_bg_color(_batFill, _batteryPct <= 20 ? TH->vol : TH->accent, 0);
+    // Win96: topbar is navy, accent is also navy — use grey so fill is visible
+    lv_color_t batColor;
+    if (_batteryPct <= 20)
+        batColor = TH->vol;
+    else if (themeGetActiveId() == TH_WIN95)
+        batColor = lv_color_hex(0x808080);
+    else
+        batColor = TH->accent;
+    lv_obj_set_style_bg_color(_batFill, batColor, 0);
+
+    // Charging icon
+    if (_lblBatCharge) {
+        if (_batteryCharging)
+            lv_obj_clear_flag(_lblBatCharge, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(_lblBatCharge, LV_OBJ_FLAG_HIDDEN);
+    }
 
     // WiFi icon
     if (wifiIsConnected()) {
@@ -1130,12 +1177,13 @@ static void refreshPlayer() {
     if (radio) {
         // Radio mode display
         RadioStatus rs = radioPlayerGetStatus();
+
         String station = radioPlayerGetStationName();
         if (station.length() == 0 && total > 0 && _plIdx >= 0 && _plIdx < total) {
             station = fileBrowserRadioGet(_plIdx).name;
         }
         if (station.length() == 0) station = "Internet Radio";
-        lv_label_set_text(_lblNow, trimName(station, 30).c_str());
+        lv_label_set_text(_lblNow, station.c_str());
 
         char subBuf[48];
         const char* rsText = "Stopped";
@@ -1172,11 +1220,23 @@ static void refreshPlayer() {
         if (fillPct < 0) fillPct = 0;
         if (fillPct > 100) fillPct = 100;
 
-        int fillW = (rs == RS_PLAYING) ? SW : (int)((int64_t)fillPct * SW / 100);
-        if (fillW < 1 && fillPct > 0 && (rs == RS_BUFFERING || rs == RS_CONNECTING)) fillW = 1;
-        if (fillW > SW) fillW = SW;
+        int fillW;
+        lv_color_t barCol;
+        if (rs == RS_PLAYING) {
+            fillW = SW;
+            barCol = lv_color_hex(0x18ff78); // solid green when playing
+        } else if (rs == RS_BUFFERING) {
+            fillW = SW; // buffer is already full at this point (sync fill in begin())
+            barCol = TH->warn;
+        } else if (rs == RS_CONNECTING) {
+            fillW = SW / 4; // fixed yellow stub while TCP connects
+            barCol = TH->warn;
+        } else {
+            fillW = 0;
+            barCol = TH->warn;
+        }
         lv_obj_set_width(_barProgress, fillW > 0 ? fillW : 1);
-        lv_obj_set_style_bg_color(_barProgress, (rs == RS_BUFFERING || rs == RS_CONNECTING) ? TH->warn : TH->accent, 0);
+        lv_obj_set_style_bg_color(_barProgress, barCol, 0);
         static uint32_t lastUiRadLog = 0;
         if (millis() - lastUiRadLog > 1000) {
             lastUiRadLog = millis();
@@ -1227,7 +1287,7 @@ static void refreshPlayer() {
         int trackNum = (curTrack >= 0) ? (curTrack + 1) : 0;
 
         if (curTrack >= 0 && curTrack < total) {
-            lv_label_set_text(_lblNow, trimName(stripMp3(fileBrowserTrack(curTrack).name), 30).c_str());
+            lv_label_set_text(_lblNow, stripMp3(fileBrowserTrack(curTrack).name).c_str());
         } else {
             lv_label_set_text(_lblNow, "No track selected");
         }
@@ -1356,15 +1416,17 @@ static void refreshPlayer() {
 // ---------------------------------------------------------------------------
 static void refreshSettings() {
     bool radio = isRadioMode();
+    // 0=Back, 1=Mode, 2=WiFi network, 3=Brightness, 4=Screen timeout,
+    // 5=KB backlight, 6=Theme, 7=Debug, 8=USB, 9=Restart, 10=Power off
     lv_label_set_text(_settingsValue[0], "");
-    String b = String((int)_displayBrightness) + "/" + String((int)DEVICE_MAX_BRIGHTNESS_LEVEL);
-    lv_label_set_text(_settingsValue[1], b.c_str());
-    lv_label_set_text(_settingsValue[2], timeoutLabel(_screenTimeoutSec).c_str());
-    lv_label_set_text(_settingsValue[3], KB_MODE_LABELS[_kbMode]);
-    lv_label_set_text(_settingsValue[4], themeName(themeGetActiveId()));
-    lv_label_set_text(_settingsValue[5], radio ? "Radio" : "MP3");
+    lv_label_set_text(_settingsValue[1], radio ? "Radio" : "MP3");
     String wssid = wifiGetSSID();
-    lv_label_set_text(_settingsValue[6], wssid.length() > 0 ? wssid.c_str() : "-- none --");
+    lv_label_set_text(_settingsValue[2], wssid.length() > 0 ? wssid.c_str() : "-- none --");
+    String b = String((int)_displayBrightness) + "/" + String((int)DEVICE_MAX_BRIGHTNESS_LEVEL);
+    lv_label_set_text(_settingsValue[3], b.c_str());
+    lv_label_set_text(_settingsValue[4], timeoutLabel(_screenTimeoutSec).c_str());
+    lv_label_set_text(_settingsValue[5], KB_MODE_LABELS[_kbMode]);
+    lv_label_set_text(_settingsValue[6], themeName(themeGetActiveId()));
     lv_label_set_text(_settingsValue[7], debugModeLabel(_debugMode));
 #if MM_USB_RUNTIME_MSC
     lv_label_set_text(_settingsValue[8], _usbModeEnabled ? "SD shared" : "Off");
@@ -1505,6 +1567,65 @@ static void pwHandleKey(char k, char raw) {
 }
 
 // ---------------------------------------------------------------------------
+// Marquee (scrolling title)
+// ---------------------------------------------------------------------------
+static void tickMarquee() {
+    if (!_lblNow || !_nowClip || _screen != UI_PLAYER) return;
+
+    // Detect text change — reset scroll
+    const char* txt = lv_label_get_text(_lblNow);
+    String cur = txt ? String(txt) : "";
+    if (cur != _mqLastText) {
+        _mqLastText  = cur;
+        _mqOffsetX   = 0;
+        _mqPhase     = MQ_PAUSE_START;
+        _mqPhaseMs   = millis();
+        _mqTextW     = lv_obj_get_width(_lblNow);
+        lv_obj_set_x(_lblNow, 0);
+        return;
+    }
+
+    // No scroll needed if text fits
+    _mqTextW = lv_obj_get_width(_lblNow);
+    int32_t overflow = _mqTextW - MQ_CLIP_W;
+    if (overflow <= 0) {
+        if (_mqOffsetX != 0) { _mqOffsetX = 0; lv_obj_set_x(_lblNow, 0); }
+        return;
+    }
+
+    uint32_t now = millis();
+    switch (_mqPhase) {
+    case MQ_PAUSE_START:
+        if (now - _mqPhaseMs >= MQ_PAUSE_START_MS) {
+            _mqPhase   = MQ_SCROLLING;
+            _mqPhaseMs = now;
+        }
+        break;
+    case MQ_SCROLLING: {
+        uint32_t elapsed = now - _mqPhaseMs;
+        _mqOffsetX = (int32_t)((uint64_t)elapsed * MQ_SPEED_PX_PER_SEC / 1000);
+        if (_mqOffsetX >= overflow) {
+            _mqOffsetX = overflow;
+            lv_obj_set_x(_lblNow, -_mqOffsetX);
+            _mqPhase   = MQ_PAUSE_END;
+            _mqPhaseMs = now;
+        } else {
+            lv_obj_set_x(_lblNow, -_mqOffsetX);
+        }
+        break;
+    }
+    case MQ_PAUSE_END:
+        if (now - _mqPhaseMs >= MQ_PAUSE_END_MS) {
+            _mqOffsetX = 0;
+            lv_obj_set_x(_lblNow, 0);
+            _mqPhase   = MQ_PAUSE_START;
+            _mqPhaseMs = now;
+        }
+        break;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public init / loop
 // ---------------------------------------------------------------------------
 void uiManagerInit() {
@@ -1522,18 +1643,6 @@ void uiManagerInit() {
     applyKbMode();
     saveUiSettings();
 
-    // Restore last track cursor
-    String lastTrack = settingsGetString("last_track", "");
-    if (lastTrack.length() > 0) {
-        int n = fileBrowserTrackCount();
-        for (int i = 0; i < n; i++) {
-            if (fileBrowserTrack(i).fullPath == lastTrack) {
-                _listCursor  = i;
-                _listScroll  = i > PLAYLIST_ROWS - 1 ? i - PLAYLIST_ROWS + 1 : 0;
-                break;
-            }
-        }
-    }
 
     lv_scr_load(_scrSplash);
     _screen   = UI_SPLASH;
@@ -1609,6 +1718,12 @@ void uiManagerLoop() {
         }
     }
 
+    static uint32_t lastMarquee = 0;
+    if (_screen == UI_PLAYER && !_screenDimmed && millis() - lastMarquee >= 50) {
+        lastMarquee = millis();
+        tickMarquee();
+    }
+
     static uint32_t lastRefresh = 0;
     if (!_screenDimmed && uiRenderEnabled()) {
         uint32_t playerPeriod = 220;
@@ -1655,10 +1770,7 @@ void uiManagerLoop() {
             if (!radio && !_usbModeEnabled && audioPlaybackAllowed() && fileBrowserTrackCount() > 0)
                 startPlaying(_listCursor);
             else if (radio && fileBrowserRadioCount() > 0) {
-                RadioStatus rs = radioPlayerGetStatus();
-                if (rs == RS_IDLE || rs == RS_ERROR) {
-                    requestRadioPlay(_listCursor, "rot_click");
-                }
+                requestRadioPlay(_listCursor, "rot_click");
             }
         } else if (_screen == UI_SETTINGS) {
             key = '\n'; keyState = KB_PRESSED;
@@ -1813,25 +1925,25 @@ void uiManagerLoop() {
         bool adjustMinus = (k == 'a' || k == 'q');
         bool adjustPlus  = (k == 'd' || k == 'w');
 
-        // 0=Back, 1=Brightness, 2=Screen timeout, 3=KB backlight, 4=Theme, 5=Mode,
-        // 6=WiFi network, 7=Debug, 8=USB, 9=Restart, 10=Power off
+        // 0=Back, 1=Mode, 2=WiFi network, 3=Brightness, 4=Screen timeout,
+        // 5=KB backlight, 6=Theme, 7=Debug, 8=USB, 9=Restart, 10=Power off
         if (adjustMinus || adjustPlus) {
             int d = adjustPlus ? 1 : -1;
-            if (_settingsCursor == 1) {
+            if (_settingsCursor == 3) {
                 _displayBrightness = (uint8_t)constrain((int)_displayBrightness + d, 1, (int)DEVICE_MAX_BRIGHTNESS_LEVEL);
                 _screenDimmed = false; applyBrightness(); saveUiSettings(); refreshSettings(); return;
             }
-            if (_settingsCursor == 2) {
+            if (_settingsCursor == 4) {
                 int idx = timeoutOptionIndex(_screenTimeoutSec);
                 idx = constrain(idx + d, 0, TIMEOUT_OPTS_N - 1);
                 _screenTimeoutSec = TIMEOUT_OPTS[idx];
                 saveUiSettings(); refreshSettings(); return;
             }
-            if (_settingsCursor == 3) {
+            if (_settingsCursor == 5) {
                 _kbMode = constrain(_kbMode + d, 0, KB_MODE_OPTS_N - 1);
                 applyKbMode(); saveUiSettings(); refreshSettings(); return;
             }
-            if (_settingsCursor == 4) {
+            if (_settingsCursor == 6) {
                 int id = (int)themeGetActiveId() + d;
                 if (id < 0) id = themeCount() - 1;
                 if (id >= themeCount()) id = 0;
@@ -1852,27 +1964,27 @@ void uiManagerLoop() {
             if (_settingsCursor == 0) {
                 showScreen(_returnScreen);
             } else if (_settingsCursor == 1) {
-                _displayBrightness = (uint8_t)((_displayBrightness % DEVICE_MAX_BRIGHTNESS_LEVEL) + 1);
-                _screenDimmed = false; applyBrightness(); saveUiSettings(); refreshSettings();
-            } else if (_settingsCursor == 2) {
-                int idx = (timeoutOptionIndex(_screenTimeoutSec) + 1) % TIMEOUT_OPTS_N;
-                _screenTimeoutSec = TIMEOUT_OPTS[idx];
-                saveUiSettings(); refreshSettings();
-            } else if (_settingsCursor == 3) {
-                _kbMode = (_kbMode + 1) % KB_MODE_OPTS_N;
-                applyKbMode(); saveUiSettings(); refreshSettings();
-            } else if (_settingsCursor == 4) {
-                int id = ((int)themeGetActiveId() + 1) % themeCount();
-                themeSetActive((ThemeId)id);
-                refreshSettings();
-            } else if (_settingsCursor == 5) {
                 switchMode(!isRadioMode());
                 _returnScreen = UI_PLAYER;
                 showScreen(UI_PLAYER);
                 return;
-            } else if (_settingsCursor == 6) {
+            } else if (_settingsCursor == 2) {
                 _returnScreen = UI_SETTINGS;
                 showScreen(UI_WIFI);
+            } else if (_settingsCursor == 3) {
+                _displayBrightness = (uint8_t)((_displayBrightness % DEVICE_MAX_BRIGHTNESS_LEVEL) + 1);
+                _screenDimmed = false; applyBrightness(); saveUiSettings(); refreshSettings();
+            } else if (_settingsCursor == 4) {
+                int idx = (timeoutOptionIndex(_screenTimeoutSec) + 1) % TIMEOUT_OPTS_N;
+                _screenTimeoutSec = TIMEOUT_OPTS[idx];
+                saveUiSettings(); refreshSettings();
+            } else if (_settingsCursor == 5) {
+                _kbMode = (_kbMode + 1) % KB_MODE_OPTS_N;
+                applyKbMode(); saveUiSettings(); refreshSettings();
+            } else if (_settingsCursor == 6) {
+                int id = ((int)themeGetActiveId() + 1) % themeCount();
+                themeSetActive((ThemeId)id);
+                refreshSettings();
             } else if (_settingsCursor == 7) {
                 _debugMode = (UiDebugMode)(((int)_debugMode + 1) % ((int)UI_DBG_DISPLAY_SD_NO_DECODE + 1));
                 if (!audioPlaybackAllowed() && audioPlayerGetState() != PS_STOPPED) audioPlayerStop();

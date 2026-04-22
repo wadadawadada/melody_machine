@@ -364,10 +364,9 @@ static void audioTask(void*) {
                         uint32_t fill = _icyBuf->getFillLevel();
                         _bufferFillPct = (int)((uint64_t)fill * 100 / _icyBufSize);
                         if (fill > 0) radioHadPositiveFill = true;
-                        // Promote to PLAYING by real buffer threshold or by
-                        // confirmed decoder progress (elapsed > 0).
-                        if ((_bufferFillPct >= 35 || _elapsed >= 1) &&
-                            _radioStatus == RS_BUFFERING) {
+                        // Promote to PLAYING once decoder is actively running
+                        // (fill > 0 means at least one successful read from buffer).
+                        if (_radioStatus == RS_BUFFERING && (fill > 0 || _elapsed >= 1)) {
                             _radioStatus = RS_PLAYING;
                         }
                         if (millis() - lastRadioLog > 1000) {

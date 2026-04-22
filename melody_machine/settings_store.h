@@ -10,6 +10,8 @@ void   settingsPutString(const char* key, const char* value);
 void   settingsPutInt   (const char* key, int value);
 void   settingsPutBool  (const char* key, bool value);
 bool   settingsSave();
+void   settingsMarkDirty();   // schedule save without holding SPI
+bool   settingsFlushIfDirty(); // call from UI loop when SD is free
 
 struct WifiNetwork { String ssid; String pass; };
 int         wifiNetworkCount();

@@ -10,6 +10,7 @@
 static DynamicJsonDocument _doc(8192);
 static bool _sdAvailable = false;
 static bool _loaded = false;
+static bool _dirty = false;
 
 // ---------------------------------------------------------------------------
 // Dot-path helpers: "wifi.networks" → nested JsonObject access
@@ -103,17 +104,30 @@ void settingsPutBool(const char* key, bool value) {
 bool settingsSave() {
     if (!_sdAvailable) return false;
     SpiGuardScope lock(pdMS_TO_TICKS(500));
-    if (!lock.locked()) return false;
+    if (!lock.locked()) {
+        _dirty = true; // retry later via settingsFlushIfDirty
+        return false;
+    }
 
     SD.mkdir("/config");
     File f = SD.open(SETTINGS_TMP_PATH, FILE_WRITE);
-    if (!f) return false;
+    if (!f) { _dirty = true; return false; }
     serializeJson(_doc, f);
     f.close();
 
     SD.remove(SETTINGS_PATH);
     SD.rename(SETTINGS_TMP_PATH, SETTINGS_PATH);
+    _dirty = false;
     return true;
+}
+
+void settingsMarkDirty() {
+    _dirty = true;
+}
+
+bool settingsFlushIfDirty() {
+    if (!_dirty) return true;
+    return settingsSave();
 }
 
 // ---------------------------------------------------------------------------
