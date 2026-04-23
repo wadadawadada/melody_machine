@@ -573,8 +573,9 @@ static void loadUiSettings() {
 
     _kbMode = constrain(settingsGetInt("kb_mode", 4), 0, KB_MODE_OPTS_N - 1);
 
-    int dbg = constrain(settingsGetInt("dbg_mode", 0), (int)UI_DBG_NORMAL, (int)UI_DBG_DISPLAY_SD_NO_DECODE);
-    _debugMode = (UiDebugMode)dbg;
+    // Safety: never restore debug mode from persisted settings.
+    // A non-UI debug mode can make the device appear "dead" after reboot.
+    _debugMode = UI_DBG_NORMAL;
 
     EqPreset eq = eqPresetFromStorage(settingsGetString("audio.eq", "flat"));
     audioPlayerSetEqPreset(eq);
@@ -589,7 +590,6 @@ static void saveUiSettings() {
     settingsPutInt("brightness", _displayBrightness);
     settingsPutInt("timeout", (int)_screenTimeoutSec);
     settingsPutInt("kb_mode", _kbMode);
-    settingsPutInt("dbg_mode", (int)_debugMode);
     settingsPutString("audio.eq", eqPresetStorageName(audioPlayerGetEqPreset()));
     settingsPutInt("repeat", (int)_repeat);
     settingsPutBool("shuffle", _shuffle);
