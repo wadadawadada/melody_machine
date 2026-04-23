@@ -133,6 +133,35 @@ Or use [ESP Flash Download Tool](https://www.espressif.com/en/support/download/o
 
 ---
 
+## GUI Flasher (One File)
+
+Use `melody_flasher.py` from the project root for a graphical flashing flow.
+
+### What it does
+
+- Auto-detects serial devices (COM ports)
+- Auto-selects firmware from root (`melody_machine.bin` by default)
+- Lets you browse and choose any `.bin` manually
+- Shows live flashing logs and a progress bar
+
+### Run
+
+```bash
+python melody_flasher.py
+```
+
+### Notes
+
+- The script is a single file and can stay in the root next to `melody_machine.bin`.
+- It flashes the selected firmware to address `0x10000` for ESP32-S3.
+- `pyserial` is optional (recommended for better port detection): `pip install pyserial`
+
+### Screenshot
+
+![GUI Flasher](img/flasher_ui.png)
+
+---
+
 ## Building from Source
 
 ### Requirements
