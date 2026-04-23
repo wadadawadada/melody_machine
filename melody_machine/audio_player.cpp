@@ -5,9 +5,11 @@
 #include <AudioFileSourceICYStream.h>
 #include <AudioFileSourceBuffer.h>
 #include <AudioGeneratorMP3.h>
+#include <AudioOutputFilterBiquad.h>
 #include <Preferences.h>
 #include <esp_heap_caps.h>
 #include <esp_task_wdt.h>
+#include "settings_store.h"
 
 // ---------------------------------------------------------------------------
 // SD source: lock SPI only for open/seek/close, NOT for read.
@@ -17,6 +19,31 @@
 static volatile uint8_t _volume       = 70;
 static Preferences _prefs;
 static volatile bool    _stopRequested = false;
+static volatile EqPreset _eqPreset = EQ_FLAT;
+static volatile EqPreset _eqPresetPending = EQ_FLAT;
+static volatile bool _eqDirty = false;
+
+static float hzToNormalizedFc(float hz) {
+    // AudioOutputFilterBiquad expects Fc in 0..0.5 (fraction of sample rate).
+    float fc = hz / 44100.0f;
+    if (fc < 0.0001f) fc = 0.0001f;
+    if (fc > 0.45f)   fc = 0.45f;
+    return fc;
+}
+
+static uint8_t effectiveVolume(uint8_t baseVol, EqPreset preset) {
+    int v = (int)baseVol;
+    switch (preset) {
+    case EQ_BASS:  v += 2; break;
+    case EQ_VOCAL: v += 1; break;
+    case EQ_BRIGHT: v -= 1; break;
+    case EQ_FLAT:
+    default: break;
+    }
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    return (uint8_t)v;
+}
 
 class LockedAudioFileSourceSD : public AudioFileSourceSD {
 public:
@@ -71,7 +98,7 @@ public:
         channels = 2;
         if (!_open) {
             _open = (instance.codec.open(bps, channels, hertz) != -1);
-            if (_open) instance.codec.setVolume(_volume);
+            if (_open) instance.codec.setVolume(effectiveVolume(_volume, (EqPreset)_eqPresetPending));
         }
         return _open;
     }
@@ -83,7 +110,7 @@ public:
         if (_open) { instance.codec.close(); _open = false; }
         vTaskDelay(pdMS_TO_TICKS(10));  // let I2S DMA drain before reopen
         _open = (instance.codec.open(bps, channels, hertz) != -1);
-        if (_open) instance.codec.setVolume(_volume);
+        if (_open) instance.codec.setVolume(effectiveVolume(_volume, (EqPreset)_eqPresetPending));
         return _open;
     }
 
@@ -95,7 +122,20 @@ public:
         if (!_open) return false;
         // Force periodic scheduler hand-off from the hot audio path.
         if (((++_yieldCounter) & 0x3FFu) == 0) vTaskDelay(1);
-        if (instance.codec.write(reinterpret_cast<uint8_t*>(sample), 4) < 0)
+        int16_t out[2] = { sample[0], sample[1] };
+        // AudioOutputFilterBiquad halves sample amplitude internally.
+        // Compensate digitally for non-flat presets instead of over-driving codec volume.
+        if (_eqPresetPending != EQ_FLAT) {
+            int32_t l = (int32_t)out[0] * 2;
+            int32_t r = (int32_t)out[1] * 2;
+            if (l > 32767) l = 32767;
+            if (l < -32768) l = -32768;
+            if (r > 32767) r = 32767;
+            if (r < -32768) r = -32768;
+            out[0] = (int16_t)l;
+            out[1] = (int16_t)r;
+        }
+        if (instance.codec.write(reinterpret_cast<uint8_t*>(out), 4) < 0)
             return false;
         return true;
     }
@@ -144,6 +184,10 @@ static volatile uint32_t    _playStartMs = 0;
 static QueueHandle_t         _cmdQueue   = nullptr;
 static TaskHandle_t          _taskHandle = nullptr;
 static EspAudioOutput*       _out        = nullptr;
+static AudioOutput*          _pipelineOut = nullptr;
+static AudioOutputFilterBiquad* _eq1 = nullptr;
+static AudioOutputFilterBiquad* _eq2 = nullptr;
+static AudioOutputFilterBiquad* _eq3 = nullptr;
 static AudioGeneratorMP3*    _mp3        = nullptr;
 static AudioFileSourceICYStream* _icy    = nullptr;
 static AudioFileSourceBuffer*    _icyBuf = nullptr;
@@ -157,6 +201,78 @@ static uint32_t pickRadioBufferSize() {
     if (free8 > 70000  && largest > 45000)  return 32768;
     if (free8 > 45000  && largest > 30000)  return 24576;
     return 16384;
+}
+
+static EqPreset eqPresetFromString(const String& s) {
+    String v = s;
+    v.toLowerCase();
+    if (v == "bright") return EQ_BRIGHT;
+    if (v == "bass")   return EQ_BASS;
+    if (v == "vocal")  return EQ_VOCAL;
+    return EQ_FLAT;
+}
+
+static const char* eqPresetLabel(EqPreset p) {
+    switch (p) {
+    case EQ_BRIGHT: return "Bright";
+    case EQ_BASS:   return "Bass";
+    case EQ_VOCAL:  return "Vocal";
+    case EQ_FLAT:
+    default:        return "Flat";
+    }
+}
+
+static void clearEqPipeline() {
+    if (_eq3) { delete _eq3; _eq3 = nullptr; }
+    if (_eq2) { delete _eq2; _eq2 = nullptr; }
+    if (_eq1) { delete _eq1; _eq1 = nullptr; }
+    _pipelineOut = _out;
+}
+
+static void rebuildEqPipeline(EqPreset preset) {
+    clearEqPipeline();
+    if (!_out || preset == EQ_FLAT) {
+        _pipelineOut = _out;
+        return;
+    }
+    AudioOutput* sink = _out;
+    auto addBiquad = [&](AudioOutputFilterBiquad*& slot, int type, float hz, float q, float gain) -> bool {
+        slot = new AudioOutputFilterBiquad(type, hzToNormalizedFc(hz), q, gain, sink);
+        if (!slot) return false;
+        sink = slot;
+        return true;
+    };
+
+    bool ok = true;
+    switch (preset) {
+    case EQ_BRIGHT:
+        ok = addBiquad(_eq1, bq_type_highshelf, 3000.0f, 0.707f, 2.2f) &&
+             addBiquad(_eq2, bq_type_peak,      1800.0f, 1.000f, 1.2f);
+        break;
+    case EQ_BASS:
+        ok = addBiquad(_eq1, bq_type_lowshelf,  220.0f, 0.707f, 6.0f) &&
+             addBiquad(_eq2, bq_type_highshelf, 3200.0f, 0.707f, -1.2f);
+        break;
+    case EQ_VOCAL:
+        ok = addBiquad(_eq1, bq_type_peak,      1700.0f, 1.000f, 3.5f) &&
+             addBiquad(_eq2, bq_type_lowshelf,   220.0f, 0.707f, -1.8f);
+        break;
+    case EQ_FLAT:
+    default:
+        ok = true;
+        break;
+    }
+
+    if (!ok) {
+        clearEqPipeline();
+        _pipelineOut = _out;
+        _eqPreset = EQ_FLAT;
+        _eqPresetPending = EQ_FLAT;
+        _eqDirty = false;
+        Serial.println("[AUDIO] EQ alloc failed, fallback to Flat");
+        return;
+    }
+    _pipelineOut = sink;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +312,94 @@ static void audioTask(void*) {
         _state   = PS_STOPPED;
     };
 
+    auto applyPendingEq = [&]() {
+        if (!_eqDirty) return;
+        rebuildEqPipeline((EqPreset)_eqPresetPending);
+        _eqPreset = _eqPresetPending;
+        _eqDirty = false;
+        Serial.printf("[AUDIO] EQ preset: %s\n", eqPresetLabel((EqPreset)_eqPreset));
+    };
+
+    auto startLocal = [&](const char* path, uint32_t fileSize) {
+        _duration = 0;
+        _done = false;
+        _mp3 = new AudioGeneratorMP3();
+        src  = new LockedAudioFileSourceSD(path);
+        if (_mp3 && src && _mp3->begin(src, _pipelineOut)) {
+            startMs = millis();
+            _playStartMs = startMs;
+            _state  = PS_PLAYING;
+            lastPlayLog = 0;
+            Serial.printf("[AUDIO] Playing: %s\n", path);
+            return;
+        }
+        Serial.printf("[AUDIO] begin() failed: %s\n", path);
+        cleanup(false);
+    };
+
+    auto startRadio = [&](const char* url) {
+        _duration = 0;
+        _done = false;
+        memset((char*)_stationName, 0, sizeof(_stationName));
+        _radioStatus = RS_CONNECTING;
+        Serial.printf("[AUDIO] heap free=%u largest=%u\n",
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+
+        _icy = new AudioFileSourceICYStream(url);
+        if (!_icy) {
+            Serial.println("[AUDIO] ICY stream alloc failed");
+            _radioStatus = RS_ERROR;
+            cleanup(false);
+            return;
+        }
+        _icy->RegisterMetadataCB(onIcyMeta, nullptr);
+
+        const uint32_t preferred = pickRadioBufferSize();
+        const uint32_t sizes[] = {preferred, 65536, 49152, 32768, 24576, 16384, 12288};
+        _icyBuf = nullptr;
+        _icyBufSize = 0;
+        for (uint32_t s : sizes) {
+            if (s > preferred) continue;
+            AudioFileSourceBuffer* candidate = new AudioFileSourceBuffer(_icy, s);
+            if (candidate) {
+                _icyBuf = candidate;
+                _icyBufSize = s;
+                break;
+            }
+        }
+        if (!_icyBuf || _icyBufSize == 0) {
+            Serial.println("[AUDIO] Cannot allocate ICY buffer");
+            _radioStatus = RS_ERROR;
+            cleanup(false);
+            return;
+        }
+
+        _mp3 = new AudioGeneratorMP3();
+        if (!_mp3) {
+            Serial.println("[AUDIO] MP3 decoder alloc failed");
+            _radioStatus = RS_ERROR;
+            cleanup(false);
+            return;
+        }
+        if (_mp3->begin(_icyBuf, _pipelineOut)) {
+            startMs = millis();
+            _playStartMs = startMs;
+            _state = PS_PLAYING;
+            _radioStatus = RS_BUFFERING;
+            lastPlayLog = 0;
+            Serial.printf("[AUDIO] Radio stream started: %s (buf=%u)\n",
+                          url, (unsigned)_icyBufSize);
+            return;
+        }
+        Serial.printf("[AUDIO] Radio begin() failed: %s\n", url);
+        _radioStatus = RS_ERROR;
+        cleanup(false);
+    };
+
     while (true) {
+        if (_eqDirty && _state == PS_STOPPED) applyPendingEq();
+
         TickType_t wait = (_state == PS_STOPPED) ? pdMS_TO_TICKS(20) : 0;
         AudioCommand cmd;
 
@@ -207,23 +410,8 @@ static void audioTask(void*) {
                 _stopRequested = true;
                 cleanup(false);
                 _stopRequested = false;
-                // Do not prefill duration from file size: this rough estimate
-                // causes UI progress to run ahead and then jump back when TLEN arrives.
-                _duration = 0;
-                _done = false;
-
-                _mp3 = new AudioGeneratorMP3();
-                src  = new LockedAudioFileSourceSD(cmd.path);
-                if (_mp3->begin(src, _out)) {
-                    startMs = millis();
-                    _playStartMs = startMs;
-                    _state  = PS_PLAYING;
-                    lastPlayLog = 0;
-                    Serial.printf("[AUDIO] Playing: %s\n", cmd.path);
-                } else {
-                    Serial.printf("[AUDIO] begin() failed: %s\n", cmd.path);
-                    cleanup(false);
-                }
+                applyPendingEq();
+                startLocal(cmd.path, cmd.fileSize);
                 break;
 
             case CMD_STOP:
@@ -251,66 +439,8 @@ static void audioTask(void*) {
                 _stopRequested = true;
                 cleanup(false);
                 _stopRequested = false;
-                _duration = 0;
-                _done = false;
-                memset((char*)_stationName, 0, sizeof(_stationName));
-                _radioStatus = RS_CONNECTING;
-                Serial.printf("[AUDIO] heap free=%u largest=%u\n",
-                              (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-                              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-
-                _icy = new AudioFileSourceICYStream(cmd.path);
-                if (!_icy) {
-                    Serial.println("[AUDIO] ICY stream alloc failed");
-                    _radioStatus = RS_ERROR;
-                    cleanup(false);
-                    break;
-                }
-                _icy->RegisterMetadataCB(onIcyMeta, nullptr);
-
-                {
-                    const uint32_t preferred = pickRadioBufferSize();
-                    const uint32_t sizes[] = {preferred, 65536, 49152, 32768, 24576, 16384, 12288};
-                    _icyBuf = nullptr;
-                    _icyBufSize = 0;
-                    for (uint32_t s : sizes) {
-                        if (s > preferred) continue;
-                        AudioFileSourceBuffer* candidate = new AudioFileSourceBuffer(_icy, s);
-                        if (candidate) {
-                            _icyBuf = candidate;
-                            _icyBufSize = s;
-                            break;
-                        }
-                    }
-                }
-
-                if (!_icyBuf || _icyBufSize == 0) {
-                    Serial.println("[AUDIO] Cannot allocate ICY buffer");
-                    _radioStatus = RS_ERROR;
-                    cleanup(false);
-                    break;
-                }
-
-                _mp3 = new AudioGeneratorMP3();
-                if (!_mp3) {
-                    Serial.println("[AUDIO] MP3 decoder alloc failed");
-                    _radioStatus = RS_ERROR;
-                    cleanup(false);
-                    break;
-                }
-                if (_mp3->begin(_icyBuf, _out)) {
-                    startMs = millis();
-                    _playStartMs = startMs;
-                    _state = PS_PLAYING;
-                    _radioStatus = RS_BUFFERING;
-                    lastPlayLog = 0;
-                    Serial.printf("[AUDIO] Radio stream started: %s (buf=%u)\n",
-                                  cmd.path, (unsigned)_icyBufSize);
-                } else {
-                    Serial.printf("[AUDIO] Radio begin() failed: %s\n", cmd.path);
-                    _radioStatus = RS_ERROR;
-                    cleanup(false);
-                }
+                applyPendingEq();
+                startRadio(cmd.path);
                 break;
 
             case CMD_STOP_RADIO:
@@ -324,7 +454,7 @@ static void audioTask(void*) {
 
         // Volume
         if (appliedVol != _volume || millis() - lastVolApply > 200) {
-            instance.codec.setVolume(_volume);
+            instance.codec.setVolume(effectiveVolume(_volume, (EqPreset)_eqPresetPending));
             appliedVol   = _volume;
             lastVolApply = millis();
         }
@@ -409,16 +539,21 @@ void audioPlayerInit() {
     _prefs.begin("mm_player", false);
     _volume = (uint8_t)_prefs.getUInt("volume", 70);
     if (_volume > 100) _volume = 70;
+    _eqPreset = eqPresetFromString(settingsGetString("audio.eq", "flat"));
+    _eqPresetPending = _eqPreset;
+    _eqDirty = false;
 
     _out      = new EspAudioOutput();
+    _pipelineOut = _out;
+    rebuildEqPipeline((EqPreset)_eqPreset);
     _mp3      = nullptr;
     _cmdQueue = xQueueCreate(1, sizeof(AudioCommand));
 
     instance.powerControl(POWER_SPEAK, true);
-    instance.codec.setVolume(_volume);
+    instance.codec.setVolume(effectiveVolume(_volume, (EqPreset)_eqPresetPending));
 
     xTaskCreatePinnedToCore(audioTask, "audio", 12288, nullptr, 2, &_taskHandle, 0);
-    Serial.println("[AUDIO] Init OK, task on Core 0");
+    Serial.printf("[AUDIO] Init OK, task on Core 0, EQ=%s\n", eqPresetLabel((EqPreset)_eqPreset));
 }
 
 static void sendCmd(const AudioCommand& c) {
@@ -447,9 +582,19 @@ void        audioPlayerSetVolume(uint8_t vol) {
     _volume = (vol > 100) ? 100 : vol;
     _prefs.putUInt("volume", _volume);
     // Apply immediately so UI controls remain responsive even if decoder loop blocks.
-    instance.codec.setVolume(_volume);
+    instance.codec.setVolume(effectiveVolume(_volume, (EqPreset)_eqPresetPending));
 }
 uint8_t     audioPlayerGetVolume()   { return _volume; }
+void        audioPlayerSetEqPreset(EqPreset preset) {
+    if (preset < EQ_FLAT || preset >= EQ_PRESET_COUNT) preset = EQ_FLAT;
+    _eqPresetPending = preset;
+    _eqDirty = true;
+}
+EqPreset    audioPlayerGetEqPreset() { return (EqPreset)_eqPresetPending; }
+const char* audioPlayerGetEqPresetName(EqPreset preset) {
+    if (preset < EQ_FLAT || preset >= EQ_PRESET_COUNT) preset = EQ_FLAT;
+    return eqPresetLabel(preset);
+}
 PlayerState audioPlayerGetState()    { return _state; }
 uint32_t    audioPlayerGetElapsed()  {
     if (_state == PS_PLAYING && _playStartMs != 0) {
@@ -478,5 +623,3 @@ void radioPlayerStop() {
 RadioStatus radioPlayerGetStatus()      { return _radioStatus; }
 String      radioPlayerGetStationName() { return String((const char*)_stationName); }
 int         radioPlayerGetBufferFillPct() { return _bufferFillPct; }
-
-

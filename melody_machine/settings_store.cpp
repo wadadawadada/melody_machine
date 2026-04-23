@@ -196,6 +196,8 @@ static void migrateFromNvs() {
 
     if (!_doc["app"].is<JsonObject>()) _doc["app"].to<JsonObject>();
     _doc["app"]["mode"] = "mp3";
+    if (!_doc["audio"].is<JsonObject>()) _doc["audio"].to<JsonObject>();
+    _doc["audio"]["eq"] = "flat";
 
     if (!_doc["wifi"].is<JsonObject>()) _doc["wifi"].to<JsonObject>();
     _doc["wifi"]["enabled"]  = false;
@@ -240,6 +242,16 @@ void settingsStoreInit() {
         _loaded = true;
         settingsSave();
     } else {
+        bool touched = false;
+        if (!_doc["audio"].is<JsonObject>()) {
+            _doc["audio"].to<JsonObject>();
+            touched = true;
+        }
+        if (_doc["audio"]["eq"].isNull() || !_doc["audio"]["eq"].is<const char*>()) {
+            _doc["audio"]["eq"] = "flat";
+            touched = true;
+        }
+        if (touched) settingsSave();
         _loaded = true;
         Serial.println("[CFG] Settings loaded from SD");
     }

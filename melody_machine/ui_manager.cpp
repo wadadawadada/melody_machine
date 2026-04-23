@@ -103,7 +103,7 @@ static lv_obj_t* _plRow[PLAYLIST_ROWS];
 static lv_obj_t* _plLabel[PLAYLIST_ROWS];
 
 // Settings
-#define SETTINGS_COUNT 11
+#define SETTINGS_COUNT 12
 static const int SETTINGS_ROW_H = 22;
 static const int SETTINGS_ROW_GAP = 2;
 static const int SETTINGS_VISIBLE = 7;
@@ -189,6 +189,7 @@ static void showPwOverlay(const String& ssid);
 static void hidePwOverlay();
 static void pwHandleKey(char k, char raw);
 static void requestRadioPlay(int idx, const char* why);
+static void applyEqPresetFromUi(EqPreset preset);
 static bool saveScreenshotToSd(char* outPath, size_t outPathLen);
 static lv_draw_buf_t* takeSnapshotCompat(lv_obj_t* obj, lv_color_format_t cf);
 
@@ -538,6 +539,25 @@ static bool isRadioMode() {
     return settingsGetString("app.mode", "mp3") == "radio";
 }
 
+static EqPreset eqPresetFromStorage(const String& s) {
+    String v = s;
+    v.toLowerCase();
+    if (v == "bright") return EQ_BRIGHT;
+    if (v == "bass")   return EQ_BASS;
+    if (v == "vocal")  return EQ_VOCAL;
+    return EQ_FLAT;
+}
+
+static const char* eqPresetStorageName(EqPreset p) {
+    switch (p) {
+    case EQ_BRIGHT: return "bright";
+    case EQ_BASS:   return "bass";
+    case EQ_VOCAL:  return "vocal";
+    case EQ_FLAT:
+    default:        return "flat";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Settings persistence (now via settings_store)
 // ---------------------------------------------------------------------------
@@ -556,6 +576,9 @@ static void loadUiSettings() {
     int dbg = constrain(settingsGetInt("dbg_mode", 0), (int)UI_DBG_NORMAL, (int)UI_DBG_DISPLAY_SD_NO_DECODE);
     _debugMode = (UiDebugMode)dbg;
 
+    EqPreset eq = eqPresetFromStorage(settingsGetString("audio.eq", "flat"));
+    audioPlayerSetEqPreset(eq);
+
     int rpt = constrain(settingsGetInt("repeat", 0), (int)RM_NONE, (int)RM_ALL);
     _repeat = (RepeatMode)rpt;
 
@@ -567,6 +590,7 @@ static void saveUiSettings() {
     settingsPutInt("timeout", (int)_screenTimeoutSec);
     settingsPutInt("kb_mode", _kbMode);
     settingsPutInt("dbg_mode", (int)_debugMode);
+    settingsPutString("audio.eq", eqPresetStorageName(audioPlayerGetEqPreset()));
     settingsPutInt("repeat", (int)_repeat);
     settingsPutBool("shuffle", _shuffle);
     settingsSave();
@@ -847,6 +871,7 @@ static void buildSettings() {
         "Back",
         "Mode",
         "WiFi network",
+        "Equalizer",
         "Brightness",
         "Screen timeout",
         "KB backlight",
@@ -1101,6 +1126,35 @@ static void requestRadioPlay(int idx, const char* why) {
     if (radioActive && idx == _plIdx) return;
     _pendingRadioPlayIdx = idx;
     _pendingRadioPlayAtMs = millis() + (radioActive ? 120 : 80);
+}
+
+static void applyEqPresetFromUi(EqPreset preset) {
+    if (preset < EQ_FLAT || preset >= EQ_PRESET_COUNT) preset = EQ_FLAT;
+    audioPlayerSetEqPreset(preset);
+    saveUiSettings();
+
+    if (isRadioMode()) {
+        int n = fileBrowserRadioCount();
+        if (n > 0 && _plIdx >= 0 && _plIdx < n) {
+            RadioStatus rs = radioPlayerGetStatus();
+            if (rs == RS_CONNECTING || rs == RS_BUFFERING || rs == RS_PLAYING) {
+                // Restart current stream so new EQ is heard immediately.
+                radioPlayerStop();
+                _pendingRadioPlayIdx = _plIdx;
+                _pendingRadioPlayAtMs = millis() + 140;
+            }
+        }
+        return;
+    }
+
+    if (_playlist.empty() || _plIdx < 0 || _plIdx >= (int)_playlist.size()) return;
+    if (audioPlayerGetState() == PS_STOPPED) return;
+
+    int curTrack = _playlist[_plIdx];
+    if (curTrack < 0 || curTrack >= fileBrowserTrackCount()) return;
+    const FileEntry& e = fileBrowserTrack(curTrack);
+    // Restart current track so new EQ is heard immediately.
+    audioPlayerPlay(e.fullPath.c_str(), e.size);
 }
 
 // ---------------------------------------------------------------------------
@@ -1416,25 +1470,26 @@ static void refreshPlayer() {
 // ---------------------------------------------------------------------------
 static void refreshSettings() {
     bool radio = isRadioMode();
-    // 0=Back, 1=Mode, 2=WiFi network, 3=Brightness, 4=Screen timeout,
-    // 5=KB backlight, 6=Theme, 7=Debug, 8=USB, 9=Restart, 10=Power off
+    // 0=Back, 1=Mode, 2=WiFi network, 3=EQ, 4=Brightness, 5=Screen timeout,
+    // 6=KB backlight, 7=Theme, 8=Debug, 9=USB, 10=Restart, 11=Power off
     lv_label_set_text(_settingsValue[0], "");
     lv_label_set_text(_settingsValue[1], radio ? "Radio" : "MP3");
     String wssid = wifiGetSSID();
     lv_label_set_text(_settingsValue[2], wssid.length() > 0 ? wssid.c_str() : "-- none --");
+    lv_label_set_text(_settingsValue[3], audioPlayerGetEqPresetName(audioPlayerGetEqPreset()));
     String b = String((int)_displayBrightness) + "/" + String((int)DEVICE_MAX_BRIGHTNESS_LEVEL);
-    lv_label_set_text(_settingsValue[3], b.c_str());
-    lv_label_set_text(_settingsValue[4], timeoutLabel(_screenTimeoutSec).c_str());
-    lv_label_set_text(_settingsValue[5], KB_MODE_LABELS[_kbMode]);
-    lv_label_set_text(_settingsValue[6], themeName(themeGetActiveId()));
-    lv_label_set_text(_settingsValue[7], debugModeLabel(_debugMode));
+    lv_label_set_text(_settingsValue[4], b.c_str());
+    lv_label_set_text(_settingsValue[5], timeoutLabel(_screenTimeoutSec).c_str());
+    lv_label_set_text(_settingsValue[6], KB_MODE_LABELS[_kbMode]);
+    lv_label_set_text(_settingsValue[7], themeName(themeGetActiveId()));
+    lv_label_set_text(_settingsValue[8], debugModeLabel(_debugMode));
 #if MM_USB_RUNTIME_MSC
-    lv_label_set_text(_settingsValue[8], _usbModeEnabled ? "SD shared" : "Off");
+    lv_label_set_text(_settingsValue[9], _usbModeEnabled ? "SD shared" : "Off");
 #else
-    lv_label_set_text(_settingsValue[8], "Unavailable");
+    lv_label_set_text(_settingsValue[9], "Unavailable");
 #endif
-    lv_label_set_text(_settingsValue[9], "");
     lv_label_set_text(_settingsValue[10], "");
+    lv_label_set_text(_settingsValue[11], "");
 
     if (_settingsCursor < _settingsScroll) _settingsScroll = _settingsCursor;
     if (_settingsCursor >= _settingsScroll + SETTINGS_VISIBLE) _settingsScroll = _settingsCursor - SETTINGS_VISIBLE + 1;
@@ -1925,32 +1980,37 @@ void uiManagerLoop() {
         bool adjustMinus = (k == 'a' || k == 'q');
         bool adjustPlus  = (k == 'd' || k == 'w');
 
-        // 0=Back, 1=Mode, 2=WiFi network, 3=Brightness, 4=Screen timeout,
-        // 5=KB backlight, 6=Theme, 7=Debug, 8=USB, 9=Restart, 10=Power off
+        // 0=Back, 1=Mode, 2=WiFi network, 3=EQ, 4=Brightness, 5=Screen timeout,
+        // 6=KB backlight, 7=Theme, 8=Debug, 9=USB, 10=Restart, 11=Power off
         if (adjustMinus || adjustPlus) {
             int d = adjustPlus ? 1 : -1;
             if (_settingsCursor == 3) {
+                int eq = constrain((int)audioPlayerGetEqPreset() + d, 0, (int)EQ_PRESET_COUNT - 1);
+                applyEqPresetFromUi((EqPreset)eq);
+                refreshSettings(); return;
+            }
+            if (_settingsCursor == 4) {
                 _displayBrightness = (uint8_t)constrain((int)_displayBrightness + d, 1, (int)DEVICE_MAX_BRIGHTNESS_LEVEL);
                 _screenDimmed = false; applyBrightness(); saveUiSettings(); refreshSettings(); return;
             }
-            if (_settingsCursor == 4) {
+            if (_settingsCursor == 5) {
                 int idx = timeoutOptionIndex(_screenTimeoutSec);
                 idx = constrain(idx + d, 0, TIMEOUT_OPTS_N - 1);
                 _screenTimeoutSec = TIMEOUT_OPTS[idx];
                 saveUiSettings(); refreshSettings(); return;
             }
-            if (_settingsCursor == 5) {
+            if (_settingsCursor == 6) {
                 _kbMode = constrain(_kbMode + d, 0, KB_MODE_OPTS_N - 1);
                 applyKbMode(); saveUiSettings(); refreshSettings(); return;
             }
-            if (_settingsCursor == 6) {
+            if (_settingsCursor == 7) {
                 int id = (int)themeGetActiveId() + d;
                 if (id < 0) id = themeCount() - 1;
                 if (id >= themeCount()) id = 0;
                 themeSetActive((ThemeId)id);
                 refreshSettings(); return;
             }
-            if (_settingsCursor == 7) {
+            if (_settingsCursor == 8) {
                 int mode = constrain((int)_debugMode + d, (int)UI_DBG_NORMAL, (int)UI_DBG_DISPLAY_SD_NO_DECODE);
                 _debugMode = (UiDebugMode)mode;
                 if (!audioPlaybackAllowed() && audioPlayerGetState() != PS_STOPPED) audioPlayerStop();
@@ -1972,24 +2032,28 @@ void uiManagerLoop() {
                 _returnScreen = UI_SETTINGS;
                 showScreen(UI_WIFI);
             } else if (_settingsCursor == 3) {
+                int eq = ((int)audioPlayerGetEqPreset() + 1) % (int)EQ_PRESET_COUNT;
+                applyEqPresetFromUi((EqPreset)eq);
+                refreshSettings();
+            } else if (_settingsCursor == 4) {
                 _displayBrightness = (uint8_t)((_displayBrightness % DEVICE_MAX_BRIGHTNESS_LEVEL) + 1);
                 _screenDimmed = false; applyBrightness(); saveUiSettings(); refreshSettings();
-            } else if (_settingsCursor == 4) {
+            } else if (_settingsCursor == 5) {
                 int idx = (timeoutOptionIndex(_screenTimeoutSec) + 1) % TIMEOUT_OPTS_N;
                 _screenTimeoutSec = TIMEOUT_OPTS[idx];
                 saveUiSettings(); refreshSettings();
-            } else if (_settingsCursor == 5) {
+            } else if (_settingsCursor == 6) {
                 _kbMode = (_kbMode + 1) % KB_MODE_OPTS_N;
                 applyKbMode(); saveUiSettings(); refreshSettings();
-            } else if (_settingsCursor == 6) {
+            } else if (_settingsCursor == 7) {
                 int id = ((int)themeGetActiveId() + 1) % themeCount();
                 themeSetActive((ThemeId)id);
                 refreshSettings();
-            } else if (_settingsCursor == 7) {
+            } else if (_settingsCursor == 8) {
                 _debugMode = (UiDebugMode)(((int)_debugMode + 1) % ((int)UI_DBG_DISPLAY_SD_NO_DECODE + 1));
                 if (!audioPlaybackAllowed() && audioPlayerGetState() != PS_STOPPED) audioPlayerStop();
                 saveUiSettings(); refreshSettings();
-            } else if (_settingsCursor == 8) {
+            } else if (_settingsCursor == 9) {
 #if MM_USB_RUNTIME_MSC
                 if (!_usbModeEnabled) {
                     audioPlayerStop(); delay(30);
@@ -1999,9 +2063,9 @@ void uiManagerLoop() {
                 }
 #endif
                 refreshSettings();
-            } else if (_settingsCursor == 9) {
-                esp_restart();
             } else if (_settingsCursor == 10) {
+                esp_restart();
+            } else if (_settingsCursor == 11) {
                 instance.sleep(WAKEUP_SRC_BOOT_BUTTON);
             }
         }
