@@ -155,12 +155,13 @@ private:
 // ---------------------------------------------------------------------------
 // Player state
 // ---------------------------------------------------------------------------
-enum CmdType { CMD_PLAY, CMD_STOP, CMD_TOGGLE_PAUSE, CMD_PLAY_RADIO, CMD_STOP_RADIO };
+enum CmdType { CMD_PLAY, CMD_STOP, CMD_TOGGLE_PAUSE, CMD_PLAY_RADIO, CMD_STOP_RADIO, CMD_SEEK };
 
 struct AudioCommand {
     CmdType  type;
     char     path[256];
     uint32_t fileSize;
+    uint32_t seekSec;   // target position in seconds (CMD_SEEK)
 };
 
 static volatile RadioStatus _radioStatus  = RS_IDLE;
@@ -180,6 +181,11 @@ static volatile uint32_t    _elapsed  = 0;
 static volatile uint32_t    _duration = 0;
 static volatile bool        _done     = false;
 static volatile uint32_t    _playStartMs = 0;
+static uint32_t              _seekOffsetSec = 0;  // seconds base added after seek/restart
+
+// Last played local file — needed for seek (restart at offset)
+static char     _lastLocalPath[256] = {};
+static uint32_t _lastLocalSize      = 0;
 
 static QueueHandle_t         _cmdQueue   = nullptr;
 static TaskHandle_t          _taskHandle = nullptr;
@@ -309,6 +315,7 @@ static void audioTask(void*) {
         if (closeCodec) _out->hardClose();
         _elapsed = 0;
         _playStartMs = 0;
+        _seekOffsetSec = 0;
         _state   = PS_STOPPED;
     };
 
@@ -320,18 +327,32 @@ static void audioTask(void*) {
         Serial.printf("[AUDIO] EQ preset: %s\n", eqPresetLabel((EqPreset)_eqPreset));
     };
 
-    auto startLocal = [&](const char* path, uint32_t fileSize) {
+    auto startLocal = [&](const char* path, uint32_t fileSize, uint32_t offsetSec = 0) {
         _duration = 0;
         _done = false;
+        strncpy(_lastLocalPath, path, sizeof(_lastLocalPath) - 1);
+        _lastLocalPath[sizeof(_lastLocalPath) - 1] = '\0';
+        _lastLocalSize = fileSize;
+        _seekOffsetSec = offsetSec;
         _mp3 = new AudioGeneratorMP3();
         src  = new LockedAudioFileSourceSD(path);
-        if (_mp3 && src && _mp3->begin(src, _pipelineOut)) {
-            startMs = millis();
-            _playStartMs = startMs;
-            _state  = PS_PLAYING;
-            lastPlayLog = 0;
-            Serial.printf("[AUDIO] Playing: %s\n", path);
-            return;
+        if (_mp3 && src) {
+            if (offsetSec > 0 && fileSize > 0) {
+                // Estimate byte offset assuming 128 kbps CBR = 16000 bytes/sec
+                uint32_t byteOffset = offsetSec * 16000;
+                if (byteOffset >= fileSize) byteOffset = 0;
+                src->seek((int32_t)byteOffset, SEEK_SET);
+                Serial.printf("[AUDIO] Seek to %us (~%u bytes)\n", offsetSec, byteOffset);
+            }
+            if (_mp3->begin(src, _pipelineOut)) {
+                startMs = millis();
+                _playStartMs = startMs;
+                _elapsed = offsetSec;
+                _state  = PS_PLAYING;
+                lastPlayLog = 0;
+                Serial.printf("[AUDIO] Playing: %s offset=%us\n", path, offsetSec);
+                return;
+            }
         }
         Serial.printf("[AUDIO] begin() failed: %s\n", path);
         cleanup(false);
@@ -449,6 +470,16 @@ static void audioTask(void*) {
                 _stopRequested = false;
                 Serial.println("[AUDIO] Radio stopped");
                 break;
+
+            case CMD_SEEK:
+                if (_lastLocalPath[0] != '\0') {
+                    _stopRequested = true;
+                    cleanup(false);
+                    _stopRequested = false;
+                    applyPendingEq();
+                    startLocal(_lastLocalPath, _lastLocalSize, cmd.seekSec);
+                }
+                break;
             }
         }
 
@@ -473,7 +504,8 @@ static void audioTask(void*) {
             AudioCommand peek;
             if (xQueuePeek(_cmdQueue, &peek, 0) == pdTRUE &&
                 (peek.type == CMD_PLAY || peek.type == CMD_STOP ||
-                 peek.type == CMD_PLAY_RADIO || peek.type == CMD_STOP_RADIO)) {
+                 peek.type == CMD_PLAY_RADIO || peek.type == CMD_STOP_RADIO ||
+                 peek.type == CMD_SEEK)) {
                 vTaskDelay(1);
                 continue;  // receive on next iteration
             }
@@ -488,7 +520,7 @@ static void audioTask(void*) {
                     _done = true;
                     Serial.println("[AUDIO] Track finished");
                 } else {
-                    _elapsed = (millis() - startMs) / 1000;
+                    _elapsed = _seekOffsetSec + (millis() - startMs) / 1000;
                     _playStartMs = startMs;
                     if (_icyBuf && _icyBufSize > 0) {
                         uint32_t fill = _icyBuf->getFillLevel();
@@ -559,7 +591,8 @@ void audioPlayerInit() {
 static void sendCmd(const AudioCommand& c) {
     if (!_cmdQueue) return;
     bool isStop = (c.type == CMD_PLAY || c.type == CMD_STOP ||
-                   c.type == CMD_PLAY_RADIO || c.type == CMD_STOP_RADIO);
+                   c.type == CMD_PLAY_RADIO || c.type == CMD_STOP_RADIO ||
+                   c.type == CMD_SEEK);
     if (isStop) _stopRequested = true;
     if (c.type == CMD_PLAY) Serial.printf("[AUDIO] CMD_PLAY send: %s\n", c.path);
     if (c.type == CMD_PLAY_RADIO) Serial.printf("[AUDIO] CMD_PLAY_RADIO send: %s\n", c.path);
@@ -576,6 +609,12 @@ void audioPlayerPlay(const char* path, uint32_t fileSizeBytes) {
 
 void audioPlayerStop()        { AudioCommand c = {}; c.type = CMD_STOP;         sendCmd(c); }
 void audioPlayerTogglePause() { AudioCommand c = {}; c.type = CMD_TOGGLE_PAUSE; sendCmd(c); }
+void audioPlayerSeek(uint32_t targetSec) {
+    AudioCommand c = {};
+    c.type    = CMD_SEEK;
+    c.seekSec = targetSec;
+    sendCmd(c);
+}
 
 bool        audioPlayerIsPaused()    { return _state == PS_PAUSED; }
 void        audioPlayerSetVolume(uint8_t vol) {
@@ -598,7 +637,7 @@ const char* audioPlayerGetEqPresetName(EqPreset preset) {
 PlayerState audioPlayerGetState()    { return _state; }
 uint32_t    audioPlayerGetElapsed()  {
     if (_state == PS_PLAYING && _playStartMs != 0) {
-        uint32_t live = (millis() - _playStartMs) / 1000;
+        uint32_t live = _seekOffsetSec + (millis() - _playStartMs) / 1000;
         return (live > _elapsed) ? live : _elapsed;
     }
     return _elapsed;

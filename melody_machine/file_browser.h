@@ -24,6 +24,14 @@ int               fileBrowserFindTrack(const String& fullPath);
 
 struct RadioStation { String name; String url; };
 
-bool                 fileBrowserScanRadio(const char* folder = "/M3U");
+// Radio: two-level browsing — playlist files list, then stations inside one playlist
+bool                 fileBrowserScanRadio(const char* folder = "/melody_machine/m3u");
 int                  fileBrowserRadioCount();
 const RadioStation&  fileBrowserRadioGet(int index);
+
+// M3U playlist file list
+int                  fileBrowserM3uCount();
+String               fileBrowserM3uName(int index);
+bool                 fileBrowserM3uLoad(int index);   // load stations from playlist #index
+int                  fileBrowserM3uSelected();        // -1 = showing playlist list
+void                 fileBrowserM3uGoBack();          // return to playlist list

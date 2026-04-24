@@ -1,4 +1,4 @@
-# Melody Machine v0.1
+# Melody Machine v0.2
 
 MP3 player and internet radio firmware for the **LilyGO T-LoRa Pager** (ESP32-S3).
 
@@ -12,11 +12,15 @@ MP3 player and internet radio firmware for the **LilyGO T-LoRa Pager** (ESP32-S3
 
 ## Features
 
-- **MP3 Player** — plays MP3 files from SD card with folder browsing, shuffle, and repeat modes
+- **MP3 Player** — plays MP3 files from SD card with folder browser, shuffle, repeat modes, and seek
 - **Internet Radio** — streams internet radio via M3U playlists over WiFi (ICY metadata support)
+- **Folder browser** — navigate into subdirectories; `..` row returns to parent
+- **Radio playlist browser** — two-level navigation: playlist file list → stations inside
+- **Seek** — rewind / fast-forward MP3 tracks with the rotary encoder (±5 s per step)
+- **Auto power-off** — configurable idle power-off timer (15 min – 2 h), activates when playback is stopped
 - **LVGL UI** — graphical interface on the 480×222 TFT display with 4 switchable themes
 - **WiFi Manager** — non-blocking WiFi with network list, password entry via on-screen keyboard, and auto-reconnect
-- **Settings** — all settings persisted as JSON on SD card; survives reboots and reflashes
+- **Settings** — all settings persisted as JSON on SD card (`/melody_machine/settings.json`); survives reboots and reflashes
 - **Dual-core audio** — MP3 decoding runs on Core 0 via FreeRTOS, keeping the UI responsive on Core 1
 
 ### Themes
@@ -41,43 +45,48 @@ MP3 player and internet radio firmware for the **LilyGO T-LoRa Pager** (ESP32-S3
 
 ## Controls
 
-### File Browser
-
-| Input | Action |
-|-------|--------|
-| Rotate encoder | Navigate list |
-| Click encoder | Enter folder / play track |
-| `P` or `SYM` | Toggle playback |
-| `B` / Backspace | Go up one folder |
-| `S` | Open settings |
-
 ### Player Screen
 
 | Input | Action |
 |-------|--------|
-| Rotate encoder | Previous / Next track |
-| Click encoder | Toggle pause |
-| `P` | Toggle pause |
+| Rotate encoder | Scroll browser list |
+| Click encoder | Enter folder / play track / confirm |
 | `Q` / `A` | Volume +5 / -5 |
+| `W` / `D` | Previous / next track |
+| `Space` | Play / pause |
+| `B` / Backspace | Stop · go up folder · exit seek mode |
 | `R` | Cycle repeat: off → one → all |
 | `H` | Toggle shuffle |
-| `B` | Back to browser |
+| `N` | Toggle **seek mode** (MP3 only, while playing/paused) |
 | `S` | Open settings |
+| `S` + `H` | Screenshot to SD |
+| `i` | Open controls help |
+
+#### Seek Mode (`N`)
+
+Press `N` to enter seek mode. The status chip shows **SEEK** in yellow.
+
+| Input | Action |
+|-------|--------|
+| Rotate encoder | Jump ±5 seconds |
+| `Enter` or `B` | Exit seek mode |
 
 ### Settings Screen
 
 | Row | Description |
 |-----|-------------|
+| Mode | Switch MP3 ↔ Radio |
+| WiFi network | Connect / manage networks |
+| Equalizer | Flat / Bright / Bass / Vocal |
 | Brightness | Display brightness |
 | Screen timeout | Auto-dim timer |
-| KB backlight | Keyboard backlight (`ALT+B` anywhere) |
+| KB backlight | Keyboard backlight timeout |
 | Theme | Cycle through 4 themes |
-| Mode | Switch between MP3 and Radio mode |
-| WiFi network | Connect / manage networks |
-| WiFi enable | Toggle WiFi on/off |
-| Debug mode | Enable serial debug output |
-| USB mode | USB serial / MSC |
-| Restart / Power off | Device control |
+| Auto power-off | Power off after idle: Off / 15m / 30m / 45m / 1h / 90m / 2h |
+| Debug mode | Serial debug output |
+| USB mode | USB MSC (SD card sharing) |
+| Restart device | Reboot |
+| Power off | Deep sleep |
 
 ---
 
@@ -85,15 +94,21 @@ MP3 player and internet radio firmware for the **LilyGO T-LoRa Pager** (ESP32-S3
 
 ```
 SD:/
-├── config/
-│   └── settings.json    ← auto-created on first boot
-├── MP3/
-│   └── **/*.mp3         ← music files (subdirectories supported)
-└── M3U/
-    └── *.m3u            ← internet radio playlists
+└── melody_machine/
+    ├── settings.json        ← auto-created on first boot
+    ├── mp3/
+    │   ├── song1.mp3
+    │   └── subfolder/
+    │       └── song2.mp3
+    └── m3u/
+        ├── rock.m3u
+        └── jazz.m3u
 ```
 
-### Example M3U playlist (`/M3U/stations.m3u`)
+> **Migration note:** previous versions used `/MP3/`, `/M3U/`, `/config/settings.json`.  
+> Move your files to the new paths above before first boot with v2.1 firmware.
+
+### Example M3U playlist (`/melody_machine/m3u/stations.m3u`)
 
 ```
 #EXTM3U
@@ -106,7 +121,7 @@ http://other.example.com/stream.mp3
 
 ### Adding WiFi networks
 
-Edit `/config/settings.json` on the SD card (or use the WiFi screen in settings):
+Edit `/melody_machine/settings.json` on the SD card (or use the WiFi screen in settings):
 
 ```json
 {

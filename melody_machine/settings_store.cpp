@@ -4,8 +4,8 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 
-#define SETTINGS_PATH     "/config/settings.json"
-#define SETTINGS_TMP_PATH "/config/settings.tmp"
+#define SETTINGS_PATH     "/melody_machine/settings.json"
+#define SETTINGS_TMP_PATH "/melody_machine/settings.tmp"
 
 static DynamicJsonDocument _doc(8192);
 static bool _sdAvailable = false;
@@ -109,7 +109,7 @@ bool settingsSave() {
         return false;
     }
 
-    SD.mkdir("/config");
+    SD.mkdir("/melody_machine");
     File f = SD.open(SETTINGS_TMP_PATH, FILE_WRITE);
     if (!f) { _dirty = true; return false; }
     serializeJson(_doc, f);
@@ -218,7 +218,7 @@ void settingsStoreInit() {
         return;
     }
 
-    SD.mkdir("/config");
+    SD.mkdir("/melody_machine");
 
     bool parseOk = false;
     {

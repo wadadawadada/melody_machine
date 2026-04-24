@@ -58,6 +58,11 @@ static int _listScroll = 0;
 static RepeatMode _repeat = RM_NONE;
 static bool _shuffle = false;
 
+// MP3 folder browser: true = browsing dirs/files, false = playlist-only view
+// In folder browser mode the right panel shows fileBrowserCount() items (dirs+files).
+// Row 0 is ".." (back) when we're inside a subdirectory.
+static bool _mp3BrowserMode = true;
+
 static uint8_t _displayBrightness = DEVICE_MAX_BRIGHTNESS_LEVEL;
 static uint32_t _screenTimeoutSec = 60;
 static bool _screenDimmed = false;
@@ -103,7 +108,7 @@ static lv_obj_t* _plRow[PLAYLIST_ROWS];
 static lv_obj_t* _plLabel[PLAYLIST_ROWS];
 
 // Settings
-#define SETTINGS_COUNT 12
+#define SETTINGS_COUNT 13
 static const int SETTINGS_ROW_H = 22;
 static const int SETTINGS_ROW_GAP = 2;
 static const int SETTINGS_VISIBLE = 7;
@@ -119,6 +124,15 @@ static bool _kbBacklight = true;
 static uint32_t _kbTimeoutSec = 0;
 static bool _kbDimmed = false;
 static uint32_t _lastPauseToggleMs = 0;
+
+// Seek mode (MP3 only): encoder adjusts target position, seek applied on exit
+static bool     _seekMode       = false;
+static uint32_t _seekTargetSec  = 0;
+static const int32_t SEEK_STEP_SEC = 5;
+
+// Auto power-off
+static uint32_t _powerOffTimeoutSec = 0;  // 0 = disabled
+static uint32_t _lastActivityForPowerOff = 0;
 
 // Marquee (scrolling title) state
 static enum { MQ_PAUSE_START, MQ_SCROLLING, MQ_PAUSE_END } _mqPhase = MQ_PAUSE_START;
@@ -303,6 +317,7 @@ static void applyBrightness() {
 
 static void noteActivity() {
     _lastInputMs = millis();
+    _lastActivityForPowerOff = millis();
     if (_screenDimmed) { _screenDimmed = false; applyBrightness(); }
     if (_kbDimmed && _kbBacklight) { _kbDimmed = false; instance.kb.setBrightness(255); }
 }
@@ -478,6 +493,22 @@ static int currentTrackIndex() {
     return _playlist[_plIdx];
 }
 
+// Convert a track-list index to the corresponding browser row index.
+// Browser rows: row 0 = ".." if canGoUp, then fileBrowserGet(0..n-1).
+// Returns the track's row, or -1 if not found in current dir view.
+static int trackIdxToBrowserRow(int trackIdx) {
+    if (trackIdx < 0 || trackIdx >= fileBrowserTrackCount()) return -1;
+    const String& tpath = fileBrowserTrack(trackIdx).fullPath;
+    bool hasBack = fileBrowserCanGoUp();
+    int n = fileBrowserCount();
+    for (int i = 0; i < n; i++) {
+        if (fileBrowserGet(i).fullPath == tpath) {
+            return hasBack ? (i + 1) : i;
+        }
+    }
+    return -1;
+}
+
 static void clampListWindow(int total) {
     if (total <= 0) { _listCursor = 0; _listScroll = 0; return; }
     _listCursor = constrain(_listCursor, 0, total - 1);
@@ -488,6 +519,22 @@ static void clampListWindow(int total) {
 
 static const uint32_t TIMEOUT_OPTS[] = {15, 30, 60, 120, 300, 0};
 static const int TIMEOUT_OPTS_N = sizeof(TIMEOUT_OPTS) / sizeof(TIMEOUT_OPTS[0]);
+
+// Power-off timer options (seconds): Off, 15m, 30m, 45m, 1h, 90m, 2h
+static const uint32_t POWEROFF_OPTS[] = {0, 900, 1800, 2700, 3600, 5400, 7200};
+static const int POWEROFF_OPTS_N = sizeof(POWEROFF_OPTS) / sizeof(POWEROFF_OPTS[0]);
+
+static int powerOffOptionIndex(uint32_t sec) {
+    for (int i = 0; i < POWEROFF_OPTS_N; i++) if (POWEROFF_OPTS[i] == sec) return i;
+    return 0;
+}
+
+static String powerOffLabel(uint32_t sec) {
+    if (sec == 0) return "Off";
+    if (sec < 3600) { char b[12]; snprintf(b, sizeof(b), "%lum", (unsigned long)(sec / 60)); return String(b); }
+    if (sec % 3600 == 0) { char b[12]; snprintf(b, sizeof(b), "%luh", (unsigned long)(sec / 3600)); return String(b); }
+    char b[16]; snprintf(b, sizeof(b), "%luh%lum", (unsigned long)(sec/3600), (unsigned long)((sec%3600)/60)); return String(b);
+}
 
 static const int KB_MODE_OPTS_N = 5;
 static const char* KB_MODE_LABELS[KB_MODE_OPTS_N] = {"Off","15s","30s","1m","Never"};
@@ -584,6 +631,11 @@ static void loadUiSettings() {
     _repeat = (RepeatMode)rpt;
 
     _shuffle = settingsGetBool("shuffle", false);
+
+    _powerOffTimeoutSec = (uint32_t)settingsGetInt("poweroff_timeout", 0);
+    bool poValid = false;
+    for (int i = 0; i < POWEROFF_OPTS_N; i++) if (POWEROFF_OPTS[i] == _powerOffTimeoutSec) { poValid = true; break; }
+    if (!poValid) _powerOffTimeoutSec = 0;
 }
 
 static void saveUiSettings() {
@@ -593,6 +645,7 @@ static void saveUiSettings() {
     settingsPutString("audio.eq", eqPresetStorageName(audioPlayerGetEqPreset()));
     settingsPutInt("repeat", (int)_repeat);
     settingsPutBool("shuffle", _shuffle);
+    settingsPutInt("poweroff_timeout", (int)_powerOffTimeoutSec);
     settingsSave();
 }
 
@@ -647,9 +700,9 @@ static void buildPlayer() {
     lv_obj_set_pos(_batFill, 446, 7);
     stylePanel(_batFill, TH->accent);
 
-    // Charging lightning bolt — inside battery box, black, scaled down + rotated
+    // Charging lightning bolt — inside battery box, yellow, scaled down + rotated
     _lblBatCharge = lv_label_create(top);
-    styleLabel(_lblBatCharge, lv_color_hex(0x000000), TH->fontSmall);
+    styleLabel(_lblBatCharge, lv_color_hex(0xFFCC00), TH->fontSmall);
     lv_obj_set_pos(_lblBatCharge, 456, 7);
     lv_label_set_text(_lblBatCharge, LV_SYMBOL_CHARGE);
     lv_obj_set_style_transform_scale(_lblBatCharge, 190, 0);   // ~74% of original
@@ -769,7 +822,7 @@ static void buildPlayer() {
     _lblListTitle = lv_label_create(_scrPlayer);
     styleLabel(_lblListTitle, TH->accent, TH->fontSmall);
     lv_obj_set_pos(_lblListTitle, 310, 25);
-    lv_label_set_text(_lblListTitle, isRadioMode() ? "STATIONS" : "PLAYLIST");
+    lv_label_set_text(_lblListTitle, isRadioMode() ? "STATIONS" : "BROWSER");
 
     for (int i = 0; i < PLAYLIST_ROWS; i++) {
         int ry = 38 + i * 20;
@@ -830,9 +883,10 @@ static void buildInfo() {
         "[Q][A]       volume +/-\n"
         "[W][D]       prev / next\n"
         "[SPC]        play / pause\n"
-        "[B]          stop\n"
+        "[B]          stop / back\n"
         "[R]          repeat mode\n"
-        "[H]          shuffle");
+        "[H]          shuffle\n"
+        "[N]          seek mode");
 
     _lblInfoRight = lv_label_create(_scrInfo);
     styleLabel(_lblInfoRight, TH->text, TH->fontBody);
@@ -845,7 +899,9 @@ static void buildInfo() {
         "[S+H]        screenshot\n"
         "[rot]        list scroll\n"
         "[rot click]  play select\n"
-        "[ENTER]      play track");
+        "[ENTER]      play track\n"
+        "seek: [rot] +/-5s\n"
+        "      [ENTER/B] exit");
 
     lv_obj_t* hint = lv_label_create(_scrInfo);
     styleLabel(hint, TH->muted, TH->fontBody);
@@ -876,6 +932,7 @@ static void buildSettings() {
         "Screen timeout",
         "KB backlight",
         "Theme",
+        "Auto power-off",
         "Debug mode",
         "USB mode",
         "Restart device",
@@ -1037,8 +1094,10 @@ static void startPlaying(int trackIdx) {
     buildPlaylist(trackIdx);
     const FileEntry& e = fileBrowserTrack(_playlist[_plIdx]);
     audioPlayerPlay(e.fullPath.c_str(), e.size);
-    _listCursor = trackIdx;
-    clampListWindow(fileBrowserTrackCount());
+    // Keep _listCursor where the user had it (browser cursor ≠ track index).
+    // Only clamp to the browser total so it stays valid.
+    int browserTotal = fileBrowserCount() + (fileBrowserCanGoUp() ? 1 : 0);
+    clampListWindow(browserTotal > 0 ? browserTotal : 1);
     if (_screen != UI_PLAYER) showScreen(UI_PLAYER);
     else refreshPlayer();
 }
@@ -1070,7 +1129,9 @@ static void playNext() {
     }
     const FileEntry& e = fileBrowserTrack(_playlist[_plIdx]);
     audioPlayerPlay(e.fullPath.c_str(), e.size);
-    _listCursor = _playlist[_plIdx];
+    { int row = trackIdxToBrowserRow(_playlist[_plIdx]); if (row >= 0) _listCursor = row; }
+    int bt = fileBrowserCount() + (fileBrowserCanGoUp() ? 1 : 0);
+    clampListWindow(bt > 0 ? bt : 1);
     refreshPlayer();
 }
 
@@ -1089,7 +1150,9 @@ static void playPrev() {
     if (_plIdx < 0) _plIdx = (_repeat == RM_ALL) ? n - 1 : 0;
     const FileEntry& e = fileBrowserTrack(_playlist[_plIdx]);
     audioPlayerPlay(e.fullPath.c_str(), e.size);
-    _listCursor = _playlist[_plIdx];
+    { int row = trackIdxToBrowserRow(_playlist[_plIdx]); if (row >= 0) _listCursor = row; }
+    int bt = fileBrowserCount() + (fileBrowserCanGoUp() ? 1 : 0);
+    clampListWindow(bt > 0 ? bt : 1);
     refreshPlayer();
 }
 
@@ -1102,12 +1165,14 @@ static void switchMode(bool toRadio) {
     _plIdx = 0;
     _listCursor = 0;
     _listScroll = 0;
+    _mp3BrowserMode = true;
     if (toRadio) {
-        fileBrowserScanRadio("/M3U");
+        fileBrowserScanRadio("/melody_machine/m3u");
         wifiAutoReconnect();
     } else {
         wifiDisconnect(); // MP3 mode keeps WiFi disabled
-        if (!fileBrowserScan("/MP3")) fileBrowserScan("/");
+        if (!fileBrowserScan("/melody_machine/mp3"))
+            if (!fileBrowserScan("/MP3")) fileBrowserScan("/");
     }
     refreshPlayer();
 }
@@ -1119,7 +1184,8 @@ static void requestRadioPlay(int idx, const char* why) {
     if (idx >= n) idx = n - 1;
     Serial.printf("[UI-RPLAY] why=%s idx=%d cur=%d pl=%d rs=%d\n",
                   (why ? why : "?"), idx, _listCursor, _plIdx, (int)radioPlayerGetStatus());
-    _listCursor = idx;
+    // Row 0 is always "..", so station idx maps to browser row idx+1
+    _listCursor = idx + 1;
     RadioStatus rs = radioPlayerGetStatus();
     bool radioActive = (rs == RS_CONNECTING || rs == RS_BUFFERING || rs == RS_PLAYING);
     // Avoid re-sending PLAY to the same active station.
@@ -1174,8 +1240,27 @@ static void refreshPlayer() {
         showScreen(UI_SETTINGS);
         return;
     }
-    int total = radio ? fileBrowserRadioCount() : fileBrowserTrackCount();
-    if (!radio) clampListWindow(total);
+    // In radio mode: if showing playlist list, total = m3u count; if showing stations, total = station count
+    bool radioShowingPlaylists = radio && (fileBrowserM3uSelected() < 0) && (fileBrowserM3uCount() > 0);
+    int total;
+    if (radio) {
+        total = radioShowingPlaylists ? fileBrowserM3uCount() : fileBrowserRadioCount();
+    } else {
+        // MP3 browser: show fileBrowserCount() (dirs+files), plus ".." row if can go up
+        int browserTotal = fileBrowserCount() + (fileBrowserCanGoUp() ? 1 : 0);
+        total = browserTotal;
+    }
+    if (!radio) {
+        // clamp against browser total
+        int browserTotal = fileBrowserCount() + (fileBrowserCanGoUp() ? 1 : 0);
+        if (browserTotal <= 0) { _listCursor = 0; _listScroll = 0; }
+        else {
+            _listCursor = constrain(_listCursor, 0, browserTotal - 1);
+            if (_listCursor < _listScroll) _listScroll = _listCursor;
+            if (_listCursor >= _listScroll + PLAYLIST_ROWS) _listScroll = _listCursor - PLAYLIST_ROWS + 1;
+            if (_listScroll < 0) _listScroll = 0;
+        }
+    }
 
     refreshBatteryState();
     char batBuf[12];
@@ -1217,7 +1302,6 @@ static void refreshPlayer() {
 
     lv_label_set_text(_lblMode, radio ? "RADIO" : "MP3");
     lv_obj_set_style_text_color(_lblMode, radio ? TH->warn : TH->text, 0);
-    lv_label_set_text(_lblListTitle, radio ? "STATIONS" : "PLAYLIST");
 
     PlayerState st = audioPlayerGetState();
 
@@ -1298,34 +1382,64 @@ static void refreshPlayer() {
                           (int)rs, fillPct, fillW, SW);
         }
 
-        // Playlist rows = stations
+        // Playlist rows: either list of .m3u files, or stations inside selected playlist
+        lv_label_set_text(_lblListTitle, radioShowingPlaylists ? "PLAYLISTS" : "STATIONS");
         for (int i = 0; i < PLAYLIST_ROWS; i++) {
             int idx = _listScroll + i;
             if (idx >= total) {
                 lv_obj_set_style_bg_color(_plRow[i], TH->panel, 0);
+                lv_obj_set_style_border_width(_plRow[i], 0, 0);
                 lv_label_set_text(_plLabel[i], "");
                 continue;
             }
-            bool isCur = (idx == _plIdx);
+            bool isCur;
+            bool isBack = false;
+            String itemText;
+            if (radioShowingPlaylists) {
+                isCur = (idx == _listCursor);
+                char nbuf[8]; snprintf(nbuf, sizeof(nbuf), "%02d", idx + 1);
+                itemText = String(nbuf) + "  " + trimName(fileBrowserM3uName(idx), 17);
+            } else {
+                // Stations: row 0 is always ".." (back to playlist list)
+                bool hasBack = (fileBrowserM3uCount() > 0);
+                if (hasBack && idx == 0) {
+                    isBack = true;
+                    isCur  = (_listCursor == 0);
+                    itemText = "..";
+                } else {
+                    int stIdx = hasBack ? (idx - 1) : idx;
+                    isCur = (idx == _listCursor);
+                    bool playing = (stIdx == _plIdx);
+                    char nbuf[8]; snprintf(nbuf, sizeof(nbuf), "%02d", stIdx + 1);
+                    itemText = String(nbuf) + "  ";
+                    if (playing) itemText += "> ";
+                    itemText += trimName(fileBrowserRadioGet(stIdx).name, playing ? 17 : 19);
+                }
+            }
             if (isCur) {
-                lv_obj_set_style_bg_color(_plRow[i], TH->playrow, 0);
-                lv_obj_set_style_border_width(_plRow[i], 0, 0);
-                lv_obj_set_style_text_color(_plLabel[i], TH->accent, 0);
-            } else if (idx == _listCursor) {
                 lv_obj_set_style_bg_color(_plRow[i], TH->hilight, 0);
                 lv_obj_set_style_border_color(_plRow[i], TH->warn, 0);
                 lv_obj_set_style_border_width(_plRow[i], 1, 0);
-                lv_obj_set_style_text_color(_plLabel[i], TH->text, 0);
+                lv_obj_set_style_text_color(_plLabel[i], isBack ? TH->muted : TH->text, 0);
             } else {
-                lv_obj_set_style_bg_color(_plRow[i], TH->panel, 0);
-                lv_obj_set_style_border_width(_plRow[i], 0, 0);
-                lv_obj_set_style_text_color(_plLabel[i], TH->dim, 0);
+                // Highlight currently playing station row
+                bool stPlaying = false;
+                if (!radioShowingPlaylists && !isBack) {
+                    bool hasBack = (fileBrowserM3uCount() > 0);
+                    int stIdx = hasBack ? (idx - 1) : idx;
+                    stPlaying = (stIdx == _plIdx) && (radioPlayerGetStatus() == RS_PLAYING || radioPlayerGetStatus() == RS_BUFFERING || radioPlayerGetStatus() == RS_CONNECTING);
+                }
+                if (stPlaying) {
+                    lv_obj_set_style_bg_color(_plRow[i], TH->playrow, 0);
+                    lv_obj_set_style_border_width(_plRow[i], 0, 0);
+                    lv_obj_set_style_text_color(_plLabel[i], TH->accent, 0);
+                } else {
+                    lv_obj_set_style_bg_color(_plRow[i], TH->panel, 0);
+                    lv_obj_set_style_border_width(_plRow[i], 0, 0);
+                    lv_obj_set_style_text_color(_plLabel[i], isBack ? TH->muted : TH->dim, 0);
+                }
             }
-            char nbuf[8]; snprintf(nbuf, sizeof(nbuf), "%02d", idx + 1);
-            String item = String(nbuf) + "  ";
-            if (isCur) item += "> ";
-            item += trimName(fileBrowserRadioGet(idx).name, 19);
-            lv_label_set_text(_plLabel[i], item.c_str());
+            lv_label_set_text(_plLabel[i], itemText.c_str());
         }
     } else {
         // MP3 mode display
@@ -1347,11 +1461,25 @@ static void refreshPlayer() {
         }
 
         if (_usbModeEnabled) lv_label_set_text(_lblShuffle, "USB MODE");
+        else if (_seekMode)        lv_label_set_text(_lblShuffle, "SEEK");
         else if (st == PS_PLAYING) lv_label_set_text(_lblShuffle, "PLAYING");
         else if (st == PS_PAUSED)  lv_label_set_text(_lblShuffle, "PAUSED");
         else                       lv_label_set_text(_lblShuffle, "STOPPED");
-        lv_obj_set_style_text_color(_lblShuffle, (st == PS_PLAYING) ? TH->accent : TH->text, 0);
-        lv_obj_set_style_border_color(_lblShuffle, (st == PS_PLAYING) ? TH->accent : TH->border, 0);
+        lv_obj_set_style_text_color(_lblShuffle, _seekMode ? TH->warn : (st == PS_PLAYING) ? TH->accent : TH->text, 0);
+        lv_obj_set_style_border_color(_lblShuffle, _seekMode ? TH->warn : (st == PS_PLAYING) ? TH->accent : TH->border, 0);
+
+        // Seek mode hint in info indicator chip
+        if (_lblInfoIndicator) {
+            if (_seekMode) {
+                lv_label_set_text(_lblInfoIndicator, "SEEK  ROT+ENTER");
+                lv_obj_set_style_text_color(_lblInfoIndicator, TH->warn, 0);
+                lv_obj_set_style_border_color(_lblInfoIndicator, TH->warn, 0);
+            } else {
+                lv_label_set_text(_lblInfoIndicator, "HELP [ i ]");
+                lv_obj_set_style_text_color(_lblInfoIndicator, TH->text, 0);
+                lv_obj_set_style_border_color(_lblInfoIndicator, TH->border, 0);
+            }
+        }
 
         if (_repeat == RM_NONE) {
             lv_obj_set_style_text_color(_lblRepeat, TH->muted, 0);
@@ -1408,7 +1536,7 @@ static void refreshPlayer() {
         if (!durationKnown) durMs = elapsedMs + 12000;
         if (elapsedMs > durMs) elapsedMs = durMs;
 
-        uint32_t elapsed       = elapsedMs / 1000;
+        uint32_t elapsed       = _seekMode ? _seekTargetSec : (elapsedMs / 1000);
         uint32_t shownDuration = durationKnown ? _uiDurationShownSec : 0;
         if (shownDuration > 0 && elapsed > shownDuration) elapsed = shownDuration;
 
@@ -1417,10 +1545,14 @@ static void refreshPlayer() {
         formatTime(shownDuration == 0 ? UINT32_MAX : shownDuration, db, sizeof(db));
 
         char subBuf[48];
-        if (shownDuration > 0)
+        if (_seekMode) {
+            snprintf(subBuf, sizeof(subBuf), ">> SEEK  %s / %s", eb,
+                     shownDuration > 0 ? db : "--:--");
+        } else if (shownDuration > 0) {
             snprintf(subBuf, sizeof(subBuf), "track %02d of %02d  %s / %s", trackNum, total, eb, db);
-        else
+        } else {
             snprintf(subBuf, sizeof(subBuf), "track %02d of %02d  %s / --:--", trackNum, total, eb);
+        }
         lv_label_set_text(_lblState, subBuf);
 
         int fillW = 1;
@@ -1432,17 +1564,55 @@ static void refreshPlayer() {
         lv_obj_set_width(_barProgress, fillW);
         lv_obj_set_style_bg_color(_barProgress, TH->accent, 0);
 
+        // MP3 folder browser: show ".." + dirs + files
+        bool hasBack = fileBrowserCanGoUp();
+        int browserCount = fileBrowserCount();
+        // Show current folder name as title (last path component)
+        {
+            const String& cp = fileBrowserCurrentPath();
+            int lastSlash = cp.lastIndexOf('/');
+            String folderName = (lastSlash >= 0 && lastSlash < (int)cp.length() - 1)
+                                ? cp.substring(lastSlash + 1)
+                                : cp;
+            folderName.toUpperCase();
+            lv_label_set_text(_lblListTitle, folderName.c_str());
+        }
         for (int i = 0; i < PLAYLIST_ROWS; i++) {
             int idx = _listScroll + i;
-            if (idx >= total) {
+            int browserTotal = browserCount + (hasBack ? 1 : 0);
+            if (idx >= browserTotal) {
                 lv_obj_set_style_bg_color(_plRow[i], TH->panel, 0);
+                lv_obj_set_style_border_width(_plRow[i], 0, 0);
                 lv_label_set_text(_plLabel[i], "");
                 continue;
             }
-            bool selected = (idx == _listCursor);
-            bool playing  = (idx == curTrack) && (st != PS_STOPPED);
 
-            if (playing) {
+            bool selected = (idx == _listCursor);
+            bool isBackRow = hasBack && (idx == 0);
+            String itemText;
+            bool isDir = false;
+            bool isPlaying = false;
+
+            if (isBackRow) {
+                itemText = "..";
+            } else {
+                int entryIdx = hasBack ? (idx - 1) : idx;
+                const FileEntry& fe = fileBrowserGet(entryIdx);
+                isDir = fe.isDir;
+                if (isDir) {
+                    itemText = "[" + trimName(fe.name, 15) + "/]";
+                } else {
+                    // Find track index in track list to detect playing
+                    int trackIdx = fileBrowserFindTrack(fe.fullPath);
+                    isPlaying = (trackIdx >= 0) && (trackIdx == curTrack) && (st != PS_STOPPED);
+                    char nbuf[8]; snprintf(nbuf, sizeof(nbuf), "%02d", entryIdx + 1);
+                    itemText = String(nbuf) + "  ";
+                    if (isPlaying) itemText += "> ";
+                    itemText += trimName(stripMp3(fe.name), isPlaying ? 17 : 19);
+                }
+            }
+
+            if (isPlaying) {
                 lv_obj_set_style_bg_color(_plRow[i], TH->playrow, 0);
                 lv_obj_set_style_border_width(_plRow[i], 0, 0);
                 lv_obj_set_style_text_color(_plLabel[i], TH->accent, 0);
@@ -1450,17 +1620,13 @@ static void refreshPlayer() {
                 lv_obj_set_style_bg_color(_plRow[i], TH->hilight, 0);
                 lv_obj_set_style_border_color(_plRow[i], TH->warn, 0);
                 lv_obj_set_style_border_width(_plRow[i], 1, 0);
-                lv_obj_set_style_text_color(_plLabel[i], TH->text, 0);
+                lv_obj_set_style_text_color(_plLabel[i], isBackRow ? TH->muted : (isDir ? TH->warn : TH->text), 0);
             } else {
                 lv_obj_set_style_bg_color(_plRow[i], TH->panel, 0);
                 lv_obj_set_style_border_width(_plRow[i], 0, 0);
-                lv_obj_set_style_text_color(_plLabel[i], TH->dim, 0);
+                lv_obj_set_style_text_color(_plLabel[i], isBackRow ? TH->muted : (isDir ? TH->warn : TH->dim), 0);
             }
-            char nbuf[8]; snprintf(nbuf, sizeof(nbuf), "%02d", idx + 1);
-            String item = String(nbuf) + "  ";
-            if (playing) item += "> ";
-            item += trimName(stripMp3(fileBrowserTrack(idx).name), 19);
-            lv_label_set_text(_plLabel[i], item.c_str());
+            lv_label_set_text(_plLabel[i], itemText.c_str());
         }
     }
 }
@@ -1471,7 +1637,7 @@ static void refreshPlayer() {
 static void refreshSettings() {
     bool radio = isRadioMode();
     // 0=Back, 1=Mode, 2=WiFi network, 3=EQ, 4=Brightness, 5=Screen timeout,
-    // 6=KB backlight, 7=Theme, 8=Debug, 9=USB, 10=Restart, 11=Power off
+    // 6=KB backlight, 7=Theme, 8=Auto power-off, 9=Debug, 10=USB, 11=Restart, 12=Power off
     lv_label_set_text(_settingsValue[0], "");
     lv_label_set_text(_settingsValue[1], radio ? "Radio" : "MP3");
     String wssid = wifiGetSSID();
@@ -1482,14 +1648,15 @@ static void refreshSettings() {
     lv_label_set_text(_settingsValue[5], timeoutLabel(_screenTimeoutSec).c_str());
     lv_label_set_text(_settingsValue[6], KB_MODE_LABELS[_kbMode]);
     lv_label_set_text(_settingsValue[7], themeName(themeGetActiveId()));
-    lv_label_set_text(_settingsValue[8], debugModeLabel(_debugMode));
+    lv_label_set_text(_settingsValue[8], powerOffLabel(_powerOffTimeoutSec).c_str());
+    lv_label_set_text(_settingsValue[9], debugModeLabel(_debugMode));
 #if MM_USB_RUNTIME_MSC
-    lv_label_set_text(_settingsValue[9], _usbModeEnabled ? "SD shared" : "Off");
+    lv_label_set_text(_settingsValue[10], _usbModeEnabled ? "SD shared" : "Off");
 #else
-    lv_label_set_text(_settingsValue[9], "Unavailable");
+    lv_label_set_text(_settingsValue[10], "Unavailable");
 #endif
-    lv_label_set_text(_settingsValue[10], "");
     lv_label_set_text(_settingsValue[11], "");
+    lv_label_set_text(_settingsValue[12], "");
 
     if (_settingsCursor < _settingsScroll) _settingsScroll = _settingsCursor;
     if (_settingsCursor >= _settingsScroll + SETTINGS_VISIBLE) _settingsScroll = _settingsCursor - SETTINGS_VISIBLE + 1;
@@ -1694,6 +1861,7 @@ void uiManagerInit() {
 
     _screenDimmed = false;
     _lastInputMs  = millis();
+    _lastActivityForPowerOff = millis();
     applyBrightness();
     applyKbMode();
     saveUiSettings();
@@ -1720,6 +1888,18 @@ void uiManagerLoop() {
     if (!_screenDimmed && _screenTimeoutSec > 0 && (millis() - _lastInputMs > _screenTimeoutSec * 1000UL)) {
         _screenDimmed = true;
         applyBrightness();
+    }
+
+    // Auto power-off: only when stopped/idle and no input for the configured duration
+    if (_powerOffTimeoutSec > 0) {
+        PlayerState pst = audioPlayerGetState();
+        RadioStatus rst = radioPlayerGetStatus();
+        bool isIdle = (pst == PS_STOPPED) && (rst == RS_IDLE || rst == RS_ERROR);
+        if (!isIdle) _lastActivityForPowerOff = millis();
+        if (isIdle && (millis() - _lastActivityForPowerOff > _powerOffTimeoutSec * 1000UL)) {
+            Serial.println("[UI] Auto power-off triggered");
+            instance.sleep(WAKEUP_SRC_BOOT_BUTTON);
+        }
     }
     if (!_kbDimmed && _kbBacklight && _kbTimeoutSec > 0 && (millis() - _lastInputMs > _kbTimeoutSec * 1000UL)) {
         _kbDimmed = true;
@@ -1822,11 +2002,7 @@ void uiManagerLoop() {
     if (rotBtnNow && !rotBtnWasPressed && (millis() - lastRotClickMs > 80)) {
         lastRotClickMs = millis();
         if (_screen == UI_PLAYER) {
-            if (!radio && !_usbModeEnabled && audioPlaybackAllowed() && fileBrowserTrackCount() > 0)
-                startPlaying(_listCursor);
-            else if (radio && fileBrowserRadioCount() > 0) {
-                requestRadioPlay(_listCursor, "rot_click");
-            }
+            key = '\n'; keyState = KB_PRESSED;  // delegate to key handler below
         } else if (_screen == UI_SETTINGS) {
             key = '\n'; keyState = KB_PRESSED;
         } else if (_screen == UI_WIFI) {
@@ -1838,15 +2014,29 @@ void uiManagerLoop() {
     if (rot.dir != ROTARY_DIR_NONE) {
         int dir = (rot.dir == ROTARY_DIR_UP) ? 1 : -1;
         if (_screen == UI_PLAYER) {
-            if (instance.kb.symbol_key_pressed) {
+            if (_seekMode && !radio) {
+                // Seek mode: encoder adjusts target, seek applied on exit
+                int32_t target = (int32_t)_seekTargetSec + dir * SEEK_STEP_SEC;
+                if (target < 0) target = 0;
+                _seekTargetSec = (uint32_t)target;
+                refreshPlayer();
+            } else if (instance.kb.symbol_key_pressed) {
                 uint8_t v = audioPlayerGetVolume();
                 audioPlayerSetVolume((uint8_t)constrain((int)v + dir * 5, 0, 100));
                 refreshPlayer();
             } else {
                 _listCursor += dir;
-                int listTotal = radio ? fileBrowserRadioCount() : fileBrowserTrackCount();
+                int listTotal;
+                if (radio) {
+                    bool showPl = (fileBrowserM3uSelected() < 0) && (fileBrowserM3uCount() > 0);
+                    listTotal = showPl ? fileBrowserM3uCount() : fileBrowserRadioCount() + (fileBrowserM3uCount() > 0 ? 1 : 0);
+                } else {
+                    listTotal = fileBrowserCount() + (fileBrowserCanGoUp() ? 1 : 0);
+                }
                 _listCursor = constrain(_listCursor, 0, listTotal > 0 ? listTotal - 1 : 0);
-                clampListWindow(listTotal);
+                if (_listCursor < _listScroll) _listScroll = _listCursor;
+                if (_listCursor >= _listScroll + PLAYLIST_ROWS) _listScroll = _listCursor - PLAYLIST_ROWS + 1;
+                if (_listScroll < 0) _listScroll = 0;
                 refreshPlayer();
             }
         } else if (_screen == UI_SETTINGS) {
@@ -1893,7 +2083,16 @@ void uiManagerLoop() {
                 }
             } else {
                 if (audioPlayerGetState() == PS_STOPPED) {
-                    if (fileBrowserTrackCount() > 0) startPlaying(_listCursor);
+                    // Find the track under cursor in the folder browser
+                    bool hasBack = fileBrowserCanGoUp();
+                    int entryIdx = hasBack ? (_listCursor - 1) : _listCursor;
+                    if (entryIdx >= 0 && entryIdx < fileBrowserCount()) {
+                        const FileEntry& fe = fileBrowserGet(entryIdx);
+                        if (!fe.isDir) {
+                            int trackIdx = fileBrowserFindTrack(fe.fullPath);
+                            if (trackIdx >= 0) startPlaying(trackIdx);
+                        }
+                    }
                 } else {
                     audioPlayerTogglePause();
                 }
@@ -1901,9 +2100,58 @@ void uiManagerLoop() {
             _lastPauseToggleMs = millis();
             refreshPlayer();
         } else if (key == '\n' || key == '\r') {
-            if (_usbModeEnabled || !audioPlaybackAllowed()) return;
-            if (!radio) {
-                if (fileBrowserTrackCount() > 0) startPlaying(_listCursor);
+            if (_seekMode) {
+                _seekMode = false;
+                audioPlayerSeek(_seekTargetSec);
+                refreshPlayer();
+                return;
+            }
+            if (_usbModeEnabled) return;
+            if (radio) {
+                // Radio two-level browser
+                bool showPl = (fileBrowserM3uSelected() < 0) && (fileBrowserM3uCount() > 0);
+                if (showPl) {
+                    // Select a playlist file
+                    if (_listCursor >= 0 && _listCursor < fileBrowserM3uCount()) {
+                        fileBrowserM3uLoad(_listCursor);
+                        _listCursor = 0; _listScroll = 0; _plIdx = 0;
+                        refreshPlayer();
+                    }
+                } else {
+                    // Stations list: row 0 is always ".."
+                    if (_listCursor == 0) {
+                        fileBrowserM3uGoBack();
+                        _listCursor = 0; _listScroll = 0;
+                        refreshPlayer();
+                    } else {
+                        int stIdx = _listCursor - 1;
+                        if (audioPlaybackAllowed() && stIdx >= 0 && stIdx < fileBrowserRadioCount()) {
+                            requestRadioPlay(stIdx, "enter");
+                        }
+                    }
+                }
+            } else {
+                // MP3 folder browser
+                bool hasBack = fileBrowserCanGoUp();
+                if (hasBack && _listCursor == 0) {
+                    // ".." go up
+                    fileBrowserGoUp();
+                    _listCursor = 0; _listScroll = 0;
+                    refreshPlayer();
+                } else {
+                    int entryIdx = hasBack ? (_listCursor - 1) : _listCursor;
+                    if (entryIdx >= 0 && entryIdx < fileBrowserCount()) {
+                        const FileEntry& fe = fileBrowserGet(entryIdx);
+                        if (fe.isDir) {
+                            fileBrowserEnter(entryIdx);
+                            _listCursor = 0; _listScroll = 0;
+                            refreshPlayer();
+                        } else if (audioPlaybackAllowed()) {
+                            int trackIdx = fileBrowserFindTrack(fe.fullPath);
+                            if (trackIdx >= 0) startPlaying(trackIdx);
+                        }
+                    }
+                }
             }
         } else if (k == 'q') {
             uint8_t v = audioPlayerGetVolume();
@@ -1937,8 +2185,44 @@ void uiManagerLoop() {
         } else if (k == 's') {
             _pendingSComboAtMs = millis();
         } else if (k == 'b' || key == 8) {
-            if (radio) radioPlayerStop(); else audioPlayerStop();
+            if (_seekMode) {
+                _seekMode = false;
+                audioPlayerSeek(_seekTargetSec);
+                refreshPlayer();
+                return;
+            }
+            if (radio) {
+                bool showPl = (fileBrowserM3uSelected() < 0) && (fileBrowserM3uCount() > 0);
+                if (!showPl) {
+                    // In stations view: go back to playlist list
+                    radioPlayerStop();
+                    fileBrowserM3uGoBack();
+                    _listCursor = 0; _listScroll = 0;
+                } else {
+                    radioPlayerStop();
+                }
+            } else {
+                if (fileBrowserCanGoUp()) {
+                    fileBrowserGoUp();
+                    _listCursor = 0; _listScroll = 0;
+                } else {
+                    audioPlayerStop();
+                }
+            }
             refreshPlayer();
+        } else if (k == 'n') {
+            // Toggle seek mode (MP3 only, while playing or paused)
+            PlayerState pst = audioPlayerGetState();
+            if (!radio && !_usbModeEnabled && (pst == PS_PLAYING || pst == PS_PAUSED)) {
+                _seekMode = !_seekMode;
+                if (_seekMode) {
+                    _seekTargetSec = audioPlayerGetElapsed();
+                } else {
+                    // Exiting via N — apply seek
+                    audioPlayerSeek(_seekTargetSec);
+                }
+                refreshPlayer();
+            }
         } else if (k == 'i') {
             _returnScreen = UI_PLAYER;
             showScreen(UI_INFO);
@@ -1981,7 +2265,7 @@ void uiManagerLoop() {
         bool adjustPlus  = (k == 'd' || k == 'w');
 
         // 0=Back, 1=Mode, 2=WiFi network, 3=EQ, 4=Brightness, 5=Screen timeout,
-        // 6=KB backlight, 7=Theme, 8=Debug, 9=USB, 10=Restart, 11=Power off
+        // 6=KB backlight, 7=Theme, 8=Auto power-off, 9=Debug, 10=USB, 11=Restart, 12=Power off
         if (adjustMinus || adjustPlus) {
             int d = adjustPlus ? 1 : -1;
             if (_settingsCursor == 3) {
@@ -2011,6 +2295,13 @@ void uiManagerLoop() {
                 refreshSettings(); return;
             }
             if (_settingsCursor == 8) {
+                int idx = powerOffOptionIndex(_powerOffTimeoutSec);
+                idx = constrain(idx + d, 0, POWEROFF_OPTS_N - 1);
+                _powerOffTimeoutSec = POWEROFF_OPTS[idx];
+                _lastActivityForPowerOff = millis();
+                saveUiSettings(); refreshSettings(); return;
+            }
+            if (_settingsCursor == 9) {
                 int mode = constrain((int)_debugMode + d, (int)UI_DBG_NORMAL, (int)UI_DBG_DISPLAY_SD_NO_DECODE);
                 _debugMode = (UiDebugMode)mode;
                 if (!audioPlaybackAllowed() && audioPlayerGetState() != PS_STOPPED) audioPlayerStop();
@@ -2050,10 +2341,15 @@ void uiManagerLoop() {
                 themeSetActive((ThemeId)id);
                 refreshSettings();
             } else if (_settingsCursor == 8) {
+                int idx = (powerOffOptionIndex(_powerOffTimeoutSec) + 1) % POWEROFF_OPTS_N;
+                _powerOffTimeoutSec = POWEROFF_OPTS[idx];
+                _lastActivityForPowerOff = millis();
+                saveUiSettings(); refreshSettings();
+            } else if (_settingsCursor == 9) {
                 _debugMode = (UiDebugMode)(((int)_debugMode + 1) % ((int)UI_DBG_DISPLAY_SD_NO_DECODE + 1));
                 if (!audioPlaybackAllowed() && audioPlayerGetState() != PS_STOPPED) audioPlayerStop();
                 saveUiSettings(); refreshSettings();
-            } else if (_settingsCursor == 9) {
+            } else if (_settingsCursor == 10) {
 #if MM_USB_RUNTIME_MSC
                 if (!_usbModeEnabled) {
                     audioPlayerStop(); delay(30);
@@ -2063,9 +2359,9 @@ void uiManagerLoop() {
                 }
 #endif
                 refreshSettings();
-            } else if (_settingsCursor == 10) {
-                esp_restart();
             } else if (_settingsCursor == 11) {
+                esp_restart();
+            } else if (_settingsCursor == 12) {
                 instance.sleep(WAKEUP_SRC_BOOT_BUTTON);
             }
         }

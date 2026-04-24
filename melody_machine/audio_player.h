@@ -21,6 +21,7 @@ uint32_t    audioPlayerGetElapsed();
 uint32_t    audioPlayerGetDuration();
 bool        audioPlayerTrackDone();
 void        audioPlayerClearDone();
+void        audioPlayerSeek(uint32_t targetSec);
 
 void        radioPlayerPlayURL(const char* url);
 void        radioPlayerStop();
