@@ -1,6 +1,7 @@
 #include "ui_manager.h"
 #include "audio_player.h"
 #include "file_browser.h"
+#include "favorites_store.h"
 #include "img_splash.h"
 #include "spi_guard.h"
 #include "theme_manager.h"
@@ -104,6 +105,7 @@ static lv_obj_t* _lblWifi = nullptr;
 static lv_obj_t* _lblMode = nullptr;
 static lv_obj_t* _lblListTitle = nullptr;
 static lv_obj_t* _lblInfoSettings = nullptr;
+static lv_obj_t* _lblFavHint = nullptr;
 static lv_obj_t* _plRow[PLAYLIST_ROWS];
 static lv_obj_t* _plLabel[PLAYLIST_ROWS];
 
@@ -147,6 +149,17 @@ static const int32_t  MQ_SPEED_PX_PER_SEC = 40; // scroll speed
 static int _pendingRadioPlayIdx = -1;
 static uint32_t _pendingRadioPlayAtMs = 0;
 static uint32_t _pendingSComboAtMs = 0;
+
+// Favorites mode: shown in-place of the radio list on the player screen
+static bool     _favMode          = false;
+static int      _favCursor        = 0;
+static int      _favScroll        = 0;
+// Set when a station is launched from favorites without an open M3U playlist
+static bool     _playingFromFav   = false;
+// Toast message shown briefly at bottom of favorites list (e.g. "Already in favs")
+static String   _favToast      = "";
+static uint32_t _favToastAtMs  = 0;
+static constexpr uint32_t FAV_TOAST_MS = 2000;
 static constexpr uint32_t SHOT_COMBO_WINDOW_MS = 550;
 
 // WiFi screen
@@ -840,6 +853,13 @@ static void buildPlayer() {
         lv_label_set_text(_plLabel[i], "");
     }
 
+    _lblFavHint = lv_label_create(_scrPlayer);
+    styleLabel(_lblFavHint, TH->muted, TH->fontBody);
+    lv_obj_set_pos(_lblFavHint, RIGHT_X + 6, 200);
+    lv_obj_set_width(_lblFavHint, RIGHT_W - 12);
+    lv_label_set_long_mode(_lblFavHint, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(_lblFavHint, "");
+
     lv_obj_t* footBg = lv_obj_create(_scrPlayer);
     lv_obj_set_size(footBg, SW, PROGRESS_H);
     lv_obj_set_pos(footBg, 0, SH - PROGRESS_H);
@@ -886,7 +906,8 @@ static void buildInfo() {
         "[B]          stop / back\n"
         "[R]          repeat mode\n"
         "[H]          shuffle\n"
-        "[N]          seek mode");
+        "[N]          seek mode\n"
+        "[F]          favorites (radio)");
 
     _lblInfoRight = lv_label_create(_scrInfo);
     styleLabel(_lblInfoRight, TH->text, TH->fontBody);
@@ -901,7 +922,8 @@ static void buildInfo() {
         "[rot click]  play select\n"
         "[ENTER]      play track\n"
         "seek: [rot] +/-5s\n"
-        "      [ENTER/B] exit");
+        "      [ENTER/B] exit\n"
+        "favs: [D] delete");
 
     lv_obj_t* hint = lv_label_create(_scrInfo);
     styleLabel(hint, TH->muted, TH->fontBody);
@@ -1024,6 +1046,7 @@ static void teardownScreens() {
     if (_scrInfo)     { lv_obj_delete(_scrInfo);     _scrInfo     = nullptr; }
     if (_scrWifi)     { lv_obj_delete(_scrWifi);     _scrWifi     = nullptr; }
     _pwOverlay = nullptr; _pwPrompt = nullptr; _pwLabel = nullptr;
+    _lblFavHint = nullptr;
 }
 
 static void rebuildScreens() {
@@ -1241,7 +1264,13 @@ static void refreshPlayer() {
         return;
     }
     // In radio mode: if showing playlist list, total = m3u count; if showing stations, total = station count
-    bool radioShowingPlaylists = radio && (fileBrowserM3uSelected() < 0) && (fileBrowserM3uCount() > 0);
+    // _playingFromFav: launched from favorites without an open playlist — show favorites list instead of PLAYLISTS
+    if (_playingFromFav && radio && fileBrowserM3uSelected() < 0) {
+        // Re-enter favorites view (read-only, station is already playing)
+        _favMode = true;
+        _playingFromFav = false;
+    }
+    bool radioShowingPlaylists = radio && (fileBrowserM3uSelected() < 0) && (fileBrowserM3uCount() > 0) && !_favMode;
     int total;
     if (radio) {
         total = radioShowingPlaylists ? fileBrowserM3uCount() : fileBrowserRadioCount();
@@ -1333,6 +1362,12 @@ static void refreshPlayer() {
         lv_label_set_text(_lblState, subBuf);
 
         // Keep status chip simple in radio mode; buffering is shown by bottom progress bar.
+        if (_lblInfoIndicator && !_favMode) {
+            lv_label_set_text(_lblInfoIndicator, "HELP [ i ]");
+            lv_obj_set_style_text_color(_lblInfoIndicator, TH->text, 0);
+            lv_obj_set_style_border_color(_lblInfoIndicator, TH->border, 0);
+        }
+        if (_lblFavHint && !_favMode) lv_label_set_text(_lblFavHint, "");
         lv_label_set_text(_lblShuffle, (rs == RS_IDLE || rs == RS_ERROR) ? "STOPPED" : "PLAYING");
         lv_obj_set_style_text_color(_lblShuffle, (rs == RS_PLAYING) ? TH->accent : TH->text, 0);
         lv_obj_set_style_border_color(_lblShuffle, (rs == RS_PLAYING) ? TH->accent : TH->border, 0);
@@ -1382,64 +1417,131 @@ static void refreshPlayer() {
                           (int)rs, fillPct, fillW, SW);
         }
 
-        // Playlist rows: either list of .m3u files, or stations inside selected playlist
-        lv_label_set_text(_lblListTitle, radioShowingPlaylists ? "PLAYLISTS" : "STATIONS");
-        for (int i = 0; i < PLAYLIST_ROWS; i++) {
-            int idx = _listScroll + i;
-            if (idx >= total) {
-                lv_obj_set_style_bg_color(_plRow[i], TH->panel, 0);
-                lv_obj_set_style_border_width(_plRow[i], 0, 0);
-                lv_label_set_text(_plLabel[i], "");
-                continue;
-            }
-            bool isCur;
-            bool isBack = false;
-            String itemText;
-            if (radioShowingPlaylists) {
-                isCur = (idx == _listCursor);
-                char nbuf[8]; snprintf(nbuf, sizeof(nbuf), "%02d", idx + 1);
-                itemText = String(nbuf) + "  " + trimName(fileBrowserM3uName(idx), 17);
-            } else {
-                // Stations: row 0 is always ".." (back to playlist list)
-                bool hasBack = (fileBrowserM3uCount() > 0);
-                if (hasBack && idx == 0) {
-                    isBack = true;
-                    isCur  = (_listCursor == 0);
-                    itemText = "..";
-                } else {
-                    int stIdx = hasBack ? (idx - 1) : idx;
-                    isCur = (idx == _listCursor);
-                    bool playing = (stIdx == _plIdx);
-                    char nbuf[8]; snprintf(nbuf, sizeof(nbuf), "%02d", stIdx + 1);
-                    itemText = String(nbuf) + "  ";
-                    if (playing) itemText += "> ";
-                    itemText += trimName(fileBrowserRadioGet(stIdx).name, playing ? 17 : 19);
-                }
-            }
-            if (isCur) {
-                lv_obj_set_style_bg_color(_plRow[i], TH->hilight, 0);
-                lv_obj_set_style_border_color(_plRow[i], TH->warn, 0);
-                lv_obj_set_style_border_width(_plRow[i], 1, 0);
-                lv_obj_set_style_text_color(_plLabel[i], isBack ? TH->muted : TH->text, 0);
-            } else {
-                // Highlight currently playing station row
-                bool stPlaying = false;
-                if (!radioShowingPlaylists && !isBack) {
-                    bool hasBack = (fileBrowserM3uCount() > 0);
-                    int stIdx = hasBack ? (idx - 1) : idx;
-                    stPlaying = (stIdx == _plIdx) && (radioPlayerGetStatus() == RS_PLAYING || radioPlayerGetStatus() == RS_BUFFERING || radioPlayerGetStatus() == RS_CONNECTING);
-                }
-                if (stPlaying) {
-                    lv_obj_set_style_bg_color(_plRow[i], TH->playrow, 0);
-                    lv_obj_set_style_border_width(_plRow[i], 0, 0);
-                    lv_obj_set_style_text_color(_plLabel[i], TH->accent, 0);
-                } else {
+        // Playlist rows: favorites mode, or normal playlists/stations list
+        if (_favMode) {
+            // Favorites mode: show saved stations + "[+ Add current]" at bottom
+            int favCount = favoritesCount();
+            int favTotal = favCount + 1; // +1 for "[+ Add current]" row
+            _favCursor = constrain(_favCursor, 0, favTotal - 1);
+            if (_favCursor < _favScroll) _favScroll = _favCursor;
+            if (_favCursor >= _favScroll + PLAYLIST_ROWS) _favScroll = _favCursor - PLAYLIST_ROWS + 1;
+            if (_favScroll < 0) _favScroll = 0;
+
+            // Toast expiry
+            if (_favToast.length() > 0 && millis() - _favToastAtMs > FAV_TOAST_MS)
+                _favToast = "";
+
+            lv_label_set_text(_lblListTitle, "FAVORITES");
+            if (_lblFavHint) lv_label_set_text(_lblFavHint, "ENTER:play  D:del  B:close");
+            for (int i = 0; i < PLAYLIST_ROWS; i++) {
+                int idx = _favScroll + i;
+                if (idx >= favTotal) {
                     lv_obj_set_style_bg_color(_plRow[i], TH->panel, 0);
                     lv_obj_set_style_border_width(_plRow[i], 0, 0);
-                    lv_obj_set_style_text_color(_plLabel[i], isBack ? TH->muted : TH->dim, 0);
+                    lv_label_set_text(_plLabel[i], "");
+                    continue;
                 }
+                bool isCur = (idx == _favCursor);
+                String itemText;
+                bool isAddRow = (idx == favCount);
+                if (isAddRow) {
+                    if (_favToast.length() > 0)
+                        itemText = _favToast;
+                    else
+                        itemText = "[+ Add current]";
+                } else {
+                    const FavoriteStation& fs = favoritesGet(idx);
+                    // Mark currently playing favorite
+                    String curUrl = radioPlayerGetStationUrl();
+                    bool playing = (fs.url == curUrl) && (rs == RS_PLAYING || rs == RS_BUFFERING || rs == RS_CONNECTING);
+                    char nbuf[8]; snprintf(nbuf, sizeof(nbuf), "%02d", idx + 1);
+                    itemText = String(nbuf) + "  ";
+                    if (playing) itemText += "> ";
+                    itemText += trimName(fs.name, playing ? 17 : 19);
+                }
+                if (isCur) {
+                    lv_obj_set_style_bg_color(_plRow[i], TH->hilight, 0);
+                    lv_obj_set_style_border_color(_plRow[i], TH->warn, 0);
+                    lv_obj_set_style_border_width(_plRow[i], 1, 0);
+                    lv_obj_set_style_text_color(_plLabel[i], isAddRow ? TH->accent : TH->text, 0);
+                } else {
+                    bool stPlaying = false;
+                    if (!isAddRow) {
+                        const FavoriteStation& fs = favoritesGet(idx);
+                        String curUrl = radioPlayerGetStationUrl();
+                        stPlaying = (fs.url == curUrl) && (rs == RS_PLAYING || rs == RS_BUFFERING || rs == RS_CONNECTING);
+                    }
+                    if (stPlaying) {
+                        lv_obj_set_style_bg_color(_plRow[i], TH->playrow, 0);
+                        lv_obj_set_style_border_width(_plRow[i], 0, 0);
+                        lv_obj_set_style_text_color(_plLabel[i], TH->accent, 0);
+                    } else {
+                        lv_obj_set_style_bg_color(_plRow[i], TH->panel, 0);
+                        lv_obj_set_style_border_width(_plRow[i], 0, 0);
+                        lv_obj_set_style_text_color(_plLabel[i], isAddRow ? TH->accent : TH->dim, 0);
+                    }
+                }
+                lv_label_set_text(_plLabel[i], itemText.c_str());
             }
-            lv_label_set_text(_plLabel[i], itemText.c_str());
+        } else {
+            // Normal radio list: playlists or stations
+            lv_label_set_text(_lblListTitle, radioShowingPlaylists ? "PLAYLISTS" : "STATIONS");
+            for (int i = 0; i < PLAYLIST_ROWS; i++) {
+                int idx = _listScroll + i;
+                if (idx >= total) {
+                    lv_obj_set_style_bg_color(_plRow[i], TH->panel, 0);
+                    lv_obj_set_style_border_width(_plRow[i], 0, 0);
+                    lv_label_set_text(_plLabel[i], "");
+                    continue;
+                }
+                bool isCur;
+                bool isBack = false;
+                String itemText;
+                if (radioShowingPlaylists) {
+                    isCur = (idx == _listCursor);
+                    char nbuf[8]; snprintf(nbuf, sizeof(nbuf), "%02d", idx + 1);
+                    itemText = String(nbuf) + "  " + trimName(fileBrowserM3uName(idx), 17);
+                } else {
+                    // Stations: row 0 is always ".." (back to playlist list)
+                    bool hasBack = (fileBrowserM3uCount() > 0);
+                    if (hasBack && idx == 0) {
+                        isBack = true;
+                        isCur  = (_listCursor == 0);
+                        itemText = "..";
+                    } else {
+                        int stIdx = hasBack ? (idx - 1) : idx;
+                        isCur = (idx == _listCursor);
+                        bool playing = (stIdx == _plIdx);
+                        char nbuf[8]; snprintf(nbuf, sizeof(nbuf), "%02d", stIdx + 1);
+                        itemText = String(nbuf) + "  ";
+                        if (playing) itemText += "> ";
+                        itemText += trimName(fileBrowserRadioGet(stIdx).name, playing ? 17 : 19);
+                    }
+                }
+                if (isCur) {
+                    lv_obj_set_style_bg_color(_plRow[i], TH->hilight, 0);
+                    lv_obj_set_style_border_color(_plRow[i], TH->warn, 0);
+                    lv_obj_set_style_border_width(_plRow[i], 1, 0);
+                    lv_obj_set_style_text_color(_plLabel[i], isBack ? TH->muted : TH->text, 0);
+                } else {
+                    bool stPlaying = false;
+                    if (!radioShowingPlaylists && !isBack) {
+                        bool hasBack = (fileBrowserM3uCount() > 0);
+                        int stIdx = hasBack ? (idx - 1) : idx;
+                        stPlaying = (stIdx == _plIdx) && (radioPlayerGetStatus() == RS_PLAYING || radioPlayerGetStatus() == RS_BUFFERING || radioPlayerGetStatus() == RS_CONNECTING);
+                    }
+                    if (stPlaying) {
+                        lv_obj_set_style_bg_color(_plRow[i], TH->playrow, 0);
+                        lv_obj_set_style_border_width(_plRow[i], 0, 0);
+                        lv_obj_set_style_text_color(_plLabel[i], TH->accent, 0);
+                    } else {
+                        lv_obj_set_style_bg_color(_plRow[i], TH->panel, 0);
+                        lv_obj_set_style_border_width(_plRow[i], 0, 0);
+                        lv_obj_set_style_text_color(_plLabel[i], isBack ? TH->muted : TH->dim, 0);
+                    }
+                }
+                lv_label_set_text(_plLabel[i], itemText.c_str());
+            }
         }
     } else {
         // MP3 mode display
@@ -1852,6 +1954,7 @@ static void tickMarquee() {
 // ---------------------------------------------------------------------------
 void uiManagerInit() {
     loadUiSettings();
+    favoritesInit();
 
     buildSplash();
     buildPlayer();
@@ -2024,6 +2127,10 @@ void uiManagerLoop() {
                 uint8_t v = audioPlayerGetVolume();
                 audioPlayerSetVolume((uint8_t)constrain((int)v + dir * 5, 0, 100));
                 refreshPlayer();
+            } else if (_favMode) {
+                int favTotal = favoritesCount() + 1;
+                _favCursor = constrain(_favCursor + dir, 0, favTotal - 1);
+                refreshPlayer();
             } else {
                 _listCursor += dir;
                 int listTotal;
@@ -2071,6 +2178,97 @@ void uiManagerLoop() {
             _pendingSComboAtMs = 0;
         }
 
+        // Favorites mode intercepts most input
+        if (_favMode) {
+            if (k == 'f' || k == 'b' || key == 8) {
+                // F or B: close favorites
+                _favMode = false;
+                _favToast = "";
+                refreshPlayer();
+                return;
+            }
+            if (key == '\n' || key == '\r') {
+                int favCount = favoritesCount();
+                if (_favCursor == favCount) {
+                    // "[+ Add current]" row — add current station
+                    String curUrl = radioPlayerGetStationUrl();
+                    if (curUrl.length() == 0) {
+                        _favToast = "No station playing";
+                        _favToastAtMs = millis();
+                        refreshPlayer();
+                        return;
+                    }
+                    // Get station name from M3U playlist (not ICY track title)
+                    String curName;
+                    if (_plIdx >= 0 && _plIdx < fileBrowserRadioCount())
+                        curName = fileBrowserRadioGet(_plIdx).name;
+                    if (curName.length() == 0) curName = curUrl;
+                    bool added = favoritesAdd(curName, curUrl);
+                    _favToast = added ? "Added!" : "Already in favs";
+                    _favToastAtMs = millis();
+                    if (added) _favCursor = favoritesCount() - 1; // jump to new entry
+                    refreshPlayer();
+                } else {
+                    // Select a favorite — play it directly
+                    const FavoriteStation& fs = favoritesGet(_favCursor);
+                    if (fs.url.length() > 0) {
+                        _pendingRadioPlayIdx = -1; // cancel any pending browser play
+                        radioPlayerPlayURL(fs.url.c_str());
+                        _favMode = false;
+                        _favToast = "";
+                        // Try to sync browser cursor to this station in the loaded playlist
+                        int n = fileBrowserRadioCount();
+                        _playingFromFav = true; // assume not found until proven otherwise
+                        for (int i = 0; i < n; i++) {
+                            if (fileBrowserRadioGet(i).url == fs.url) {
+                                _plIdx = i;
+                                _listCursor = i + 1; // +1 because row 0 is ".."
+                                _listScroll = constrain(_listCursor - PLAYLIST_ROWS / 2, 0, n);
+                                _playingFromFav = false; // found in current playlist
+                                break;
+                            }
+                        }
+                        refreshPlayer();
+                    }
+                }
+                return;
+            }
+            if (k == 'd') {
+                // Delete selected favorite (not the Add row)
+                if (_favCursor < favoritesCount()) {
+                    favoritesRemove(_favCursor);
+                    int newTotal = favoritesCount() + 1;
+                    _favCursor = constrain(_favCursor, 0, newTotal - 1);
+                    refreshPlayer();
+                }
+                return;
+            }
+            // Let Q/A still control volume in favMode
+            if (k == 'q') {
+                uint8_t v = audioPlayerGetVolume();
+                audioPlayerSetVolume(v < 95 ? v + 5 : 100);
+                refreshPlayer();
+                return;
+            }
+            if (k == 'a') {
+                uint8_t v = audioPlayerGetVolume();
+                audioPlayerSetVolume(v > 5 ? v - 5 : 0);
+                refreshPlayer();
+                return;
+            }
+            return; // all other keys suppressed in favMode
+        }
+
+        // F key (radio only): open favorites
+        if (k == 'f' && radio) {
+            _favMode = true;
+            _favCursor = 0;
+            _favScroll = 0;
+            _favToast = "";
+            refreshPlayer();
+            return;
+        }
+
         if (k == ' ' || k == 'p') {
             if (_usbModeEnabled || !audioPlaybackAllowed()) return;
             if (radio) {
@@ -2115,6 +2313,7 @@ void uiManagerLoop() {
                     if (_listCursor >= 0 && _listCursor < fileBrowserM3uCount()) {
                         fileBrowserM3uLoad(_listCursor);
                         _listCursor = 0; _listScroll = 0; _plIdx = 0;
+                        _playingFromFav = false;
                         refreshPlayer();
                     }
                 } else {

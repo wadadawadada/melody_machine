@@ -27,4 +27,5 @@ void        radioPlayerPlayURL(const char* url);
 void        radioPlayerStop();
 RadioStatus radioPlayerGetStatus();
 String      radioPlayerGetStationName();
+String      radioPlayerGetStationUrl();
 int         radioPlayerGetBufferFillPct();

@@ -166,6 +166,7 @@ struct AudioCommand {
 
 static volatile RadioStatus _radioStatus  = RS_IDLE;
 static volatile char        _stationName[128] = {};
+static volatile char        _stationUrl[512]  = {};
 static volatile int         _bufferFillPct = 0;
 
 static void onIcyMeta(void*, const char* type, bool, const char* str) {
@@ -362,6 +363,8 @@ static void audioTask(void*) {
         _duration = 0;
         _done = false;
         memset((char*)_stationName, 0, sizeof(_stationName));
+        strncpy((char*)_stationUrl, url ? url : "", sizeof(_stationUrl) - 1);
+        _stationUrl[sizeof(_stationUrl) - 1] = '\0';
         _radioStatus = RS_CONNECTING;
         Serial.printf("[AUDIO] heap free=%u largest=%u\n",
                       (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
@@ -661,4 +664,5 @@ void radioPlayerStop() {
 
 RadioStatus radioPlayerGetStatus()      { return _radioStatus; }
 String      radioPlayerGetStationName() { return String((const char*)_stationName); }
+String      radioPlayerGetStationUrl()  { return String((const char*)_stationUrl); }
 int         radioPlayerGetBufferFillPct() { return _bufferFillPct; }
